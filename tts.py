@@ -29,13 +29,24 @@ class SpeechPlayer:
         self._cancel_event = threading.Event()
         self._lock = threading.RLock()
         self._processes: set[subprocess.Popen] = set()
+        self._ffplay_process: subprocess.Popen | None = None
 
-    def cancel(self) -> None:
+    def reset_cancellation(self) -> None:
+        """Prepare the player for a new response after an interruption."""
+        with self._lock:
+            if self._processes:
+                raise TTSError("cannot reset TTS while a speech process is active")
+            self._cancel_event.clear()
+
+    def cancel(self) -> bool:
+        """Cancel active synthesis/playback and report whether ffplay was active."""
         self._cancel_event.set()
         with self._lock:
             processes = list(self._processes)
+            ffplay_active = self._ffplay_process is not None and self._ffplay_process.poll() is None
         for process in processes:
             self._terminate(process)
+        return ffplay_active
 
     def speak(
         self,
@@ -88,12 +99,17 @@ class SpeechPlayer:
                 ],
                 stdin=subprocess.DEVNULL,
             )
+            with self._lock:
+                self._ffplay_process = player
             try:
                 if not self._wait(player, cancel_event):
                     return False
                 if player.returncode != 0:
                     raise TTSError(self._failure_message("ffplay", player))
             finally:
+                with self._lock:
+                    if self._ffplay_process is player:
+                        self._ffplay_process = None
                 if player.poll() is None:
                     self._terminate(player)
                 self._forget(player)

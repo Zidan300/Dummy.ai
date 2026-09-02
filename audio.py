@@ -159,6 +159,10 @@ class AudioCapture:
             except queue.Empty:
                 return
 
+    def clear_pending_frames(self) -> None:
+        """Discard audio captured during processing or speaker playback."""
+        self._clear_frames()
+
     def _report_event(self, kind: str, message: str) -> None:
         try:
             self._events.put_nowait((kind, message))
@@ -223,6 +227,8 @@ class UtteranceDetector:
         capture: AudioCapture,
         stop_event: threading.Event,
         on_speech_detected=None,
+        ignore_until: float = 0.0,
+        max_utterance_seconds: float = MAX_UTTERANCE_SECONDS,
     ) -> np.ndarray | None:
         prebuffer: deque[np.ndarray] = deque(maxlen=PREBUFFER_FRAMES)
         utterance: list[np.ndarray] = []
@@ -232,6 +238,12 @@ class UtteranceDetector:
         started_at = 0.0
 
         while not stop_event.is_set():
+            if time.monotonic() < ignore_until:
+                # Consume the short speaker-start guard without allowing
+                # Dummy's own audio into the interruption pre-buffer.
+                capture.read_frame(timeout=0.1)
+                continue
+
             for kind, message in capture.drain_events():
                 if kind == "overflow":
                     logger.warning("Audio input overflow; continuing")
@@ -275,7 +287,7 @@ class UtteranceDetector:
             if silence_run >= SILENCE_FRAMES:
                 return self._to_float_audio(utterance)
 
-            if time.monotonic() - started_at >= MAX_UTTERANCE_SECONDS:
+            if time.monotonic() - started_at >= max_utterance_seconds:
                 logger.info("Maximum utterance duration reached")
                 return self._to_float_audio(utterance)
 

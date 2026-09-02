@@ -1,4 +1,4 @@
-"""Dummy Phase 2 application: streamed responses and concurrent speech."""
+"""Dummy Phase 3 application: streamed responses with natural interruption."""
 
 from __future__ import annotations
 
@@ -48,9 +48,18 @@ EXIT_COMMANDS = {
     "shut down",
     "goodbye",
     "good bye",
-    "stop",
     "terminate",
 }
+
+
+class CombinedCancellation:
+    """Event-like view that cancels on app shutdown or response interruption."""
+
+    def __init__(self, *events: threading.Event) -> None:
+        self._events = events
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events)
 
 
 class ResponsePipeline:
@@ -67,14 +76,18 @@ class ResponsePipeline:
         on_first_sentence,
         on_playback_start,
         on_error,
+        on_tts_finished=None,
     ) -> None:
         self.prompt = prompt
         self.stop_event = stop_event
+        self._cancel_event = threading.Event()
+        self._cancel_token = CombinedCancellation(stop_event, self._cancel_event)
         self.player = player
         self.on_first_token = on_first_token
         self.on_first_sentence = on_first_sentence
         self.on_playback_start = on_playback_start
         self.on_error = on_error
+        self.on_tts_finished = on_tts_finished
         self.sentences: queue.Queue[str | None] = queue.Queue(maxsize=self.QUEUE_SIZE)
         self.done = threading.Event()
         self.response = ""
@@ -118,25 +131,27 @@ class ResponsePipeline:
             self.sentences.join()
         self.done.set()
 
-    def cancel(self) -> None:
-        """Clear pending speech; the shared stop event cancels both workers."""
-        self.stop_event.set()
+    def cancel(self) -> int:
+        """Cancel this response without shutting down the application."""
+        self._cancel_event.set()
+        cleared = 0
         while True:
             try:
                 self.sentences.get_nowait()
                 self.sentences.task_done()
+                cleared += 1
             except queue.Empty:
-                return
+                return cleared
 
     def is_cancelled(self) -> bool:
-        return self.stop_event.is_set()
+        return self._cancel_token.is_set()
 
     def _generate(self) -> None:
         buffer = SentenceBuffer()
         logger.info("Gemma generation started")
 
         def receive_token(token: str) -> None:
-            if self.stop_event.is_set():
+            if self.is_cancelled():
                 return
             if not self._first_token_seen:
                 self._first_token_seen = True
@@ -153,9 +168,9 @@ class ResponsePipeline:
             self.response = stream_dummy(
                 self.prompt,
                 on_token=receive_token,
-                cancel_event=self.stop_event,
+                cancel_event=self._cancel_token,
             )
-            if not self.stop_event.is_set():
+            if not self.is_cancelled():
                 for sentence in buffer.finish():
                     if not self._first_sentence_seen:
                         self._first_sentence_seen = True
@@ -167,11 +182,11 @@ class ResponsePipeline:
                 logger.info("Gemma generation finished")
         except AIError as exc:
             self.generation_error = exc
-            if not self.stop_event.is_set():
+            if not self.is_cancelled():
                 self.on_error(exc)
         except Exception as exc:
             self.generation_error = AIError(f"Gemma worker failed: {exc}")
-            if not self.stop_event.is_set():
+            if not self.is_cancelled():
                 self.on_error(self.generation_error)
         finally:
             self._put_sentinel()
@@ -181,7 +196,7 @@ class ResponsePipeline:
         sentence = sentence.strip()
         if not sentence:
             return False
-        while not self.stop_event.is_set():
+        while not self.is_cancelled():
             try:
                 self.sentences.put(sentence, timeout=0.1)
                 return True
@@ -192,7 +207,7 @@ class ResponsePipeline:
         return False
 
     def _put_sentinel(self) -> None:
-        while not self.stop_event.is_set():
+        while not self.is_cancelled():
             try:
                 self.sentences.put(None, timeout=0.1)
                 return
@@ -203,7 +218,7 @@ class ResponsePipeline:
 
     def _speak_sentences(self) -> None:
         try:
-            while not self.stop_event.is_set():
+            while not self.is_cancelled():
                 try:
                     sentence = self.sentences.get(timeout=0.1)
                 except queue.Empty:
@@ -221,7 +236,7 @@ class ResponsePipeline:
                         return
                     played = self.player.speak(
                         sentence,
-                        self.stop_event,
+                        self._cancel_token,
                         on_playback_start=self._playback_started,
                     )
                     if not played and not self.is_cancelled():
@@ -230,23 +245,149 @@ class ResponsePipeline:
                         self._spoken_sentence_count += 1
                 except TTSError as exc:
                     self.tts_error = exc
-                    if not self.stop_event.is_set():
+                    if not self.is_cancelled():
                         self.on_error(exc)
                 finally:
                     self.sentences.task_done()
         except Exception as exc:
             self.tts_error = exc
-            if not self.stop_event.is_set():
+            if not self.is_cancelled():
                 self.on_error(exc)
         finally:
+            if self.on_tts_finished:
+                self.on_tts_finished()
             self.tts_finished.set()
 
     def _playback_started(self) -> None:
-        if self._first_audio_started:
+        if self._first_audio_started or self.is_cancelled():
             return
         self._first_audio_started = True
         logger.info("TTS started")
         self.on_playback_start()
+
+
+INTERRUPTION_COMMANDS = {
+    "stop",
+    "stop talking",
+    "shut up",
+    "be quiet",
+    "quiet",
+    "cancel",
+    "never mind",
+    "that's enough",
+    "enough",
+    "pause",
+}
+
+
+def normalize_command(text: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", text.lower()))
+
+
+class BargeInMonitor:
+    """Listen for an exact interruption phrase during one response session."""
+
+    SPEAKER_START_GUARD_SECONDS = 0.35
+
+    def __init__(self, capture, transcriber, app_stop_event, on_command) -> None:
+        self.capture = capture
+        self.transcriber = transcriber
+        self.app_stop_event = app_stop_event
+        self.on_command = on_command
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._stop_event: threading.Event | None = None
+        self._session_id: int | None = None
+        self._guard_until = 0.0
+
+    def start(self, session_id: int) -> None:
+        self.stop()
+        self.capture.clear_pending_frames()
+        local_stop = threading.Event()
+        with self._lock:
+            self._session_id = session_id
+            self._stop_event = local_stop
+            self._guard_until = 0.0
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(session_id, local_stop),
+                name=f"dummy-barge-in-{session_id}",
+                daemon=False,
+            )
+            thread = self._thread
+        thread.start()
+
+    def set_playback_guard(self, session_id: int) -> None:
+        with self._lock:
+            if self._session_id != session_id:
+                return
+            self._guard_until = time.monotonic() + self.SPEAKER_START_GUARD_SECONDS
+        self.capture.clear_pending_frames()
+
+    def request_stop(self, session_id: int) -> None:
+        with self._lock:
+            if self._session_id == session_id and self._stop_event is not None:
+                self._stop_event.set()
+
+    def stop(self, session_id: int | None = None) -> None:
+        with self._lock:
+            if session_id is not None and self._session_id != session_id:
+                return
+            stop_event = self._stop_event
+            thread = self._thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
+                self._stop_event = None
+                self._session_id = None
+
+    def _run(self, session_id: int, local_stop: threading.Event) -> None:
+        cancel = CombinedCancellation(self.app_stop_event, local_stop)
+        try:
+            detector = UtteranceDetector()
+            while not cancel.is_set():
+                with self._lock:
+                    guard_until = self._guard_until
+                try:
+                    audio = detector.listen(
+                        self.capture,
+                        cancel,
+                        ignore_until=guard_until,
+                        max_utterance_seconds=3.0,
+                    )
+                except (AudioError, VadError) as exc:
+                    if not cancel.is_set():
+                        logger.error("Barge-in monitor failed: %s", exc)
+                    return
+                if audio is None or cancel.is_set():
+                    return
+                # Playback can begin while listen() is finishing a VAD
+                # segment. Discard that segment if the speaker-start guard
+                # was raised during the read, rather than transcribing
+                # Dummy's own audio as a possible command.
+                with self._lock:
+                    guard_until = self._guard_until
+                if time.monotonic() < guard_until:
+                    continue
+
+                try:
+                    text = self.transcriber.transcribe(audio, cancel)
+                except TranscriptionError as exc:
+                    if not cancel.is_set():
+                        logger.error("Barge-in transcription failed: %s", exc)
+                    continue
+
+                command = normalize_command(text)
+                if command in INTERRUPTION_COMMANDS or command in EXIT_COMMANDS:
+                    self.on_command(session_id, command)
+                    return
+        except Exception as exc:
+            if not cancel.is_set():
+                logger.exception("Barge-in worker failed: %s", exc)
 
 
 class VoiceController(QObject):
@@ -266,6 +407,17 @@ class VoiceController(QObject):
         self.detector: UtteranceDetector | None = None
         self.player = SpeechPlayer()
         self._pipeline: ResponsePipeline | None = None
+        self._pipeline_lock = threading.RLock()
+        self._next_session_id = 0
+        self._active_session_id: int | None = None
+        self._interrupted_session_id: int | None = None
+        self._interruption_started_at: float | None = None
+        self._barge_monitor = BargeInMonitor(
+            self.audio,
+            self.transcriber,
+            self._stop_event,
+            self._handle_barge_in,
+        )
 
     @property
     def stop_event(self) -> threading.Event:
@@ -278,10 +430,34 @@ class VoiceController(QObject):
         self._set_state("SHUTTING_DOWN")
         if first_request:
             logger.info("Shutdown requested: %s", reason)
-        if self._pipeline is not None:
-            self._pipeline.cancel()
+        self.interrupt_tts()
+        self._barge_monitor.stop()
         self.audio.stop()
-        self.player.cancel()
+
+    def interrupt_tts(
+        self,
+        session_id: int | None = None,
+        detected_at: float | None = None,
+    ) -> None:
+        """Stop current speech and generation without killing the app thread."""
+        with self._pipeline_lock:
+            pipeline = self._pipeline
+            active_session_id = self._active_session_id
+        if session_id is not None and active_session_id != session_id:
+            return
+
+        if pipeline is not None:
+            pipeline.cancel()
+            if not pipeline.generation_finished.is_set():
+                logger.info("Gemma generation cancellation requested")
+            logger.info("TTS queue cleared")
+        if self.player.cancel():
+            logger.info("Active ffplay terminated")
+        if detected_at is not None:
+            logger.info(
+                "[PERF] Barge-in response: %.2fs",
+                time.perf_counter() - detected_at,
+            )
 
     def run(self) -> None:
         try:
@@ -300,8 +476,8 @@ class VoiceController(QObject):
             self.request_shutdown("fatal voice worker error")
         finally:
             self._set_state("SHUTTING_DOWN")
-            if self._pipeline is not None:
-                self._pipeline.cancel()
+            self.interrupt_tts()
+            self._barge_monitor.stop()
             self.audio.stop()
             self.player.cancel()
             self._set_state("STOPPED")
@@ -376,6 +552,12 @@ class VoiceController(QObject):
             return
 
         self._set_state("THINKING")
+        with self._pipeline_lock:
+            self._next_session_id += 1
+            session_id = self._next_session_id
+            self._interrupted_session_id = None
+            self._interruption_started_at = None
+
         first_token_at: float | None = None
         first_sentence_at: float | None = None
         first_audio_at: float | None = None
@@ -401,14 +583,35 @@ class VoiceController(QObject):
 
         def playback_start() -> None:
             nonlocal first_audio_at
-            if first_audio_at is None:
-                first_audio_at = time.perf_counter()
-                self._set_state("SPEAKING")
-                if first_sentence_at is not None:
-                    logger.info(
-                        "[PERF] TTS start: %.2fs",
-                        first_audio_at - first_sentence_at,
-                    )
+            with self._pipeline_lock:
+                pipeline = self._pipeline
+                if (
+                    self._active_session_id != session_id
+                    or pipeline is None
+                    or pipeline.is_cancelled()
+                    or self._stop_event.is_set()
+                    or self._interrupted_session_id == session_id
+                ):
+                    return
+                if first_audio_at is None:
+                    first_audio_at = time.perf_counter()
+                    self._barge_monitor.set_playback_guard(session_id)
+                    self._set_state("SPEAKING")
+                    if first_sentence_at is not None:
+                        logger.info(
+                            "[PERF] TTS start: %.2fs",
+                            first_audio_at - first_sentence_at,
+                        )
+
+        def tts_finished() -> None:
+            self._barge_monitor.request_stop(session_id)
+
+        try:
+            self.player.reset_cancellation()
+        except TTSError as exc:
+            self._report_recoverable_error(exc)
+            self._wait_or_stop(0.25)
+            return
 
         pipeline = ResponsePipeline(
             text,
@@ -418,12 +621,18 @@ class VoiceController(QObject):
             first_sentence,
             playback_start,
             self._report_recoverable_error,
+            on_tts_finished=tts_finished,
         )
-        self._pipeline = pipeline
+        with self._pipeline_lock:
+            self._pipeline = pipeline
+            self._active_session_id = session_id
         try:
+            self._barge_monitor.start(session_id)
             pipeline.start()
             pipeline.wait()
-            if not self._stop_event.is_set():
+            with self._pipeline_lock:
+                interrupted = self._interrupted_session_id == session_id
+            if not self._stop_event.is_set() and not interrupted:
                 if pipeline.generation_error is not None:
                     self._wait_or_stop(0.75)
                 elif not pipeline.response.strip():
@@ -455,9 +664,40 @@ class VoiceController(QObject):
                         time.perf_counter() - transcription_complete_at,
                     )
         finally:
-            self._pipeline = None
+            self._barge_monitor.stop(session_id)
+            self.audio.clear_pending_frames()
+            with self._pipeline_lock:
+                if self._pipeline is pipeline:
+                    self._pipeline = None
+                    self._active_session_id = None
             if not self._stop_event.is_set():
+                try:
+                    self.player.reset_cancellation()
+                except TTSError:
+                    logger.exception("Could not reset TTS cancellation state")
                 self._set_state("LISTENING")
+
+    def _handle_barge_in(self, session_id: int, command: str) -> None:
+        detected_at = time.perf_counter()
+        with self._pipeline_lock:
+            pipeline = self._pipeline
+            if (
+                self._active_session_id != session_id
+                or pipeline is None
+                or pipeline.is_cancelled()
+                or self._interrupted_session_id == session_id
+            ):
+                return
+            self._interrupted_session_id = session_id
+            self._interruption_started_at = detected_at
+
+        logger.info('Barge-in detected: "%s"', command)
+        if command in EXIT_COMMANDS:
+            self.request_shutdown("voice exit command during response")
+            return
+        self.interrupt_tts(session_id, detected_at)
+        self._barge_monitor.request_stop(session_id)
+        self._set_state("INTERRUPTED")
 
     def _recover_microphone(self) -> bool:
         self._set_state("ERROR")
