@@ -29,7 +29,7 @@ VAD_AGGRESSIVENESS = 2
 PREBUFFER_MS = 300
 PREBUFFER_FRAMES = PREBUFFER_MS // FRAME_MS
 SPEECH_START_FRAMES = 3
-SILENCE_DURATION = 0.9
+SILENCE_DURATION = 0.72
 SILENCE_FRAMES = math.ceil(SILENCE_DURATION * 1000 / FRAME_MS)
 MAX_UTTERANCE_SECONDS = 20.0
 
@@ -335,6 +335,7 @@ class WhisperTranscriber:
                 temperature=0,
                 vad_filter=False,
                 condition_on_previous_text=False,
+                without_timestamps=True,
             )
             text_parts: list[str] = []
             for segment in segments:

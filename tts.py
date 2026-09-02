@@ -41,6 +41,7 @@ class SpeechPlayer:
         self,
         text: str,
         cancel_event: threading.Event | None = None,
+        on_playback_start=None,
     ) -> bool:
         text = text.strip()
         if not text or self._cancelled(cancel_event):
@@ -49,7 +50,11 @@ class SpeechPlayer:
         self._cancel_event.clear()
         wav_path = ""
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
+            with tempfile.NamedTemporaryFile(
+                prefix="dummy-tts-",
+                suffix=".wav",
+                delete=False,
+            ) as wav_file:
                 wav_path = wav_file.name
 
             piper = self._start(
@@ -63,7 +68,7 @@ class SpeechPlayer:
                 if not self._wait(piper, cancel_event):
                     return False
                 if piper.returncode != 0:
-                    raise TTSError(f"Piper exited with status {piper.returncode}")
+                    raise TTSError(self._failure_message("Piper", piper))
             finally:
                 if piper.poll() is None:
                     self._terminate(piper)
@@ -72,14 +77,13 @@ class SpeechPlayer:
             if self._cancelled(cancel_event):
                 return False
 
+            if on_playback_start:
+                on_playback_start()
             player = self._start(
                 [
                     FFPLAY,
                     "-autoexit",
                     "-nodisp",
-                    "-nostdin",
-                    "-loglevel",
-                    "quiet",
                     wav_path,
                 ],
                 stdin=subprocess.DEVNULL,
@@ -88,7 +92,7 @@ class SpeechPlayer:
                 if not self._wait(player, cancel_event):
                     return False
                 if player.returncode != 0:
-                    raise TTSError(f"ffplay exited with status {player.returncode}")
+                    raise TTSError(self._failure_message("ffplay", player))
             finally:
                 if player.poll() is None:
                     self._terminate(player)
@@ -113,7 +117,7 @@ class SpeechPlayer:
             args,
             stdin=stdin,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
         )
         with self._lock:
@@ -131,6 +135,17 @@ class SpeechPlayer:
     def _forget(self, process: subprocess.Popen) -> None:
         with self._lock:
             self._processes.discard(process)
+
+    @staticmethod
+    def _failure_message(name: str, process: subprocess.Popen) -> str:
+        details = ""
+        if process.stderr is not None:
+            try:
+                details = process.stderr.read().strip()
+            except OSError:
+                details = ""
+        suffix = f": {details}" if details else ""
+        return f"{name} exited with status {process.returncode}{suffix}"
 
     @staticmethod
     def _terminate(process: subprocess.Popen) -> None:

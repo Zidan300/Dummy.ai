@@ -1,17 +1,19 @@
-"""Dummy Phase 1 application and cancellable voice controller."""
+"""Dummy Phase 2 application: streamed responses and concurrent speech."""
 
 from __future__ import annotations
 
 import logging
+import queue
 import re
 import signal
 import sys
 import threading
+import time
 
 from PySide6.QtCore import QObject, QThread, Qt, QtMsgType, Signal, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
-from ai import AIError, ask_dummy
+from ai import AIError, SentenceBuffer, stream_dummy
 from audio import (
     AudioCapture,
     AudioError,
@@ -25,7 +27,6 @@ from tts import SpeechPlayer, TTSError
 
 
 logger = logging.getLogger("dummy")
-
 
 STATES = {
     "STARTING",
@@ -52,8 +53,204 @@ EXIT_COMMANDS = {
 }
 
 
+class ResponsePipeline:
+    """Generate streamed text and synthesize sentences concurrently."""
+
+    QUEUE_SIZE = 8
+
+    def __init__(
+        self,
+        prompt: str,
+        stop_event: threading.Event,
+        player: SpeechPlayer,
+        on_first_token,
+        on_first_sentence,
+        on_playback_start,
+        on_error,
+    ) -> None:
+        self.prompt = prompt
+        self.stop_event = stop_event
+        self.player = player
+        self.on_first_token = on_first_token
+        self.on_first_sentence = on_first_sentence
+        self.on_playback_start = on_playback_start
+        self.on_error = on_error
+        self.sentences: queue.Queue[str | None] = queue.Queue(maxsize=self.QUEUE_SIZE)
+        self.done = threading.Event()
+        self.response = ""
+        self.generation_finished = threading.Event()
+        self.tts_finished = threading.Event()
+        self.generation_succeeded = False
+        self.tts_succeeded = False
+        self.generation_error: Exception | None = None
+        self.tts_error: Exception | None = None
+        self._first_token_seen = False
+        self._first_sentence_seen = False
+        self._first_audio_started = False
+        self._spoken_sentence_count = 0
+        self._generation_thread = threading.Thread(
+            target=self._generate,
+            name="dummy-gemma",
+            daemon=False,
+        )
+        self._tts_thread = threading.Thread(
+            target=self._speak_sentences,
+            name="dummy-tts",
+            daemon=False,
+        )
+
+    def start(self) -> None:
+        # Start the consumer first so the first generated sentence has no
+        # extra handoff delay.
+        self._tts_thread.start()
+        self._generation_thread.start()
+
+    def wait(self) -> None:
+        """Wait until both worker threads have stopped."""
+        self._generation_thread.join()
+        self._tts_thread.join()
+        # join() is the authoritative completion check. The events make the
+        # lifecycle observable in tests and prevent a consumer-only event from
+        # being mistaken for full pipeline completion.
+        self.generation_finished.wait()
+        self.tts_finished.wait()
+        if not self.is_cancelled():
+            self.sentences.join()
+        self.done.set()
+
+    def cancel(self) -> None:
+        """Clear pending speech; the shared stop event cancels both workers."""
+        self.stop_event.set()
+        while True:
+            try:
+                self.sentences.get_nowait()
+                self.sentences.task_done()
+            except queue.Empty:
+                return
+
+    def is_cancelled(self) -> bool:
+        return self.stop_event.is_set()
+
+    def _generate(self) -> None:
+        buffer = SentenceBuffer()
+        logger.info("Gemma generation started")
+
+        def receive_token(token: str) -> None:
+            if self.stop_event.is_set():
+                return
+            if not self._first_token_seen:
+                self._first_token_seen = True
+                logger.info("First Gemma token received")
+                self.on_first_token()
+            for sentence in buffer.add(token):
+                if not self._first_sentence_seen:
+                    self._first_sentence_seen = True
+                    logger.info("First sentence ready")
+                    self.on_first_sentence()
+                self._put_sentence(sentence)
+
+        try:
+            self.response = stream_dummy(
+                self.prompt,
+                on_token=receive_token,
+                cancel_event=self.stop_event,
+            )
+            if not self.stop_event.is_set():
+                for sentence in buffer.finish():
+                    if not self._first_sentence_seen:
+                        self._first_sentence_seen = True
+                        logger.info("First sentence ready")
+                        self.on_first_sentence()
+                    self._put_sentence(sentence)
+            if not self.is_cancelled():
+                self.generation_succeeded = True
+                logger.info("Gemma generation finished")
+        except AIError as exc:
+            self.generation_error = exc
+            if not self.stop_event.is_set():
+                self.on_error(exc)
+        except Exception as exc:
+            self.generation_error = AIError(f"Gemma worker failed: {exc}")
+            if not self.stop_event.is_set():
+                self.on_error(self.generation_error)
+        finally:
+            self._put_sentinel()
+            self.generation_finished.set()
+
+    def _put_sentence(self, sentence: str) -> bool:
+        sentence = sentence.strip()
+        if not sentence:
+            return False
+        while not self.stop_event.is_set():
+            try:
+                self.sentences.put(sentence, timeout=0.1)
+                return True
+            except queue.Full:
+                if not self._tts_thread.is_alive():
+                    raise TTSError("TTS worker stopped before consuming the sentence queue")
+                continue
+        return False
+
+    def _put_sentinel(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.sentences.put(None, timeout=0.1)
+                return
+            except queue.Full:
+                if not self._tts_thread.is_alive():
+                    return
+                continue
+
+    def _speak_sentences(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    sentence = self.sentences.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    if sentence is None:
+                        self.tts_succeeded = (
+                            not self.is_cancelled()
+                            and self.generation_error is None
+                            and self.tts_error is None
+                            and self._spoken_sentence_count > 0
+                        )
+                        if self.tts_succeeded:
+                            logger.info("TTS finished")
+                        return
+                    played = self.player.speak(
+                        sentence,
+                        self.stop_event,
+                        on_playback_start=self._playback_started,
+                    )
+                    if not played and not self.is_cancelled():
+                        raise TTSError("TTS returned without playing the sentence")
+                    if played:
+                        self._spoken_sentence_count += 1
+                except TTSError as exc:
+                    self.tts_error = exc
+                    if not self.stop_event.is_set():
+                        self.on_error(exc)
+                finally:
+                    self.sentences.task_done()
+        except Exception as exc:
+            self.tts_error = exc
+            if not self.stop_event.is_set():
+                self.on_error(exc)
+        finally:
+            self.tts_finished.set()
+
+    def _playback_started(self) -> None:
+        if self._first_audio_started:
+            return
+        self._first_audio_started = True
+        logger.info("TTS started")
+        self.on_playback_start()
+
+
 class VoiceController(QObject):
-    """The only owner of the voice pipeline, running outside Qt's UI thread."""
+    """The Qt worker owning the continuous voice loop."""
 
     state_changed = Signal(str)
     error = Signal(str)
@@ -68,23 +265,21 @@ class VoiceController(QObject):
         self.transcriber = WhisperTranscriber()
         self.detector: UtteranceDetector | None = None
         self.player = SpeechPlayer()
+        self._pipeline: ResponsePipeline | None = None
 
     @property
     def stop_event(self) -> threading.Event:
         return self._stop_event
 
     def request_shutdown(self, reason: str = "shutdown requested") -> None:
-        """Thread-safe and idempotent shutdown entry point.
-
-        This method intentionally does not wait for the worker. It wakes the
-        audio loop and cancels any active playback; the worker performs the
-        ordered cleanup and emits ``finished`` when it is actually stopped.
-        """
+        """Thread-safe, idempotent entry point for every shutdown path."""
         first_request = not self._stop_event.is_set()
         self._stop_event.set()
         self._set_state("SHUTTING_DOWN")
         if first_request:
             logger.info("Shutdown requested: %s", reason)
+        if self._pipeline is not None:
+            self._pipeline.cancel()
         self.audio.stop()
         self.player.cancel()
 
@@ -105,8 +300,8 @@ class VoiceController(QObject):
             self.request_shutdown("fatal voice worker error")
         finally:
             self._set_state("SHUTTING_DOWN")
-            # Ordered cleanup: stop listening, release microphone, cancel
-            # processing/playback, then let the QThread finish.
+            if self._pipeline is not None:
+                self._pipeline.cancel()
             self.audio.stop()
             self.player.cancel()
             self._set_state("STOPPED")
@@ -155,6 +350,7 @@ class VoiceController(QObject):
         if utterance is None or self._stop_event.is_set():
             return
 
+        speech_end_at = time.perf_counter()
         self._set_state("PROCESSING")
         try:
             text = self.transcriber.transcribe(utterance, self._stop_event)
@@ -163,13 +359,16 @@ class VoiceController(QObject):
             self._wait_or_stop(0.75)
             return
 
+        transcription_complete_at = time.perf_counter()
+        logger.info("Transcription complete")
+        logger.info("[PERF] Transcription: %.2fs", transcription_complete_at - speech_end_at)
         if self._stop_event.is_set():
             return
-        logger.info("Transcription complete")
         if not text:
+            logger.warning("Empty transcription; returning to LISTENING")
             self._set_state("LISTENING")
             return
-        print(f"You: {text}", flush=True)
+        logger.info("User: %s", text)
 
         if self._is_exit_command(text):
             logger.info("Voice exit command detected")
@@ -177,27 +376,86 @@ class VoiceController(QObject):
             return
 
         self._set_state("THINKING")
-        try:
-            response = ask_dummy(text, cancel_event=self._stop_event)
-        except AIError as exc:
-            self._report_recoverable_error(exc)
-            self._wait_or_stop(0.75)
-            return
+        first_token_at: float | None = None
+        first_sentence_at: float | None = None
+        first_audio_at: float | None = None
 
-        if self._stop_event.is_set():
-            return
-        if not response:
-            self._set_state("LISTENING")
-            return
-        print(f"Dummy: {response}", flush=True)
+        def first_token() -> None:
+            nonlocal first_token_at
+            if first_token_at is None:
+                first_token_at = time.perf_counter()
+                logger.info(
+                    "[PERF] First token: %.2fs",
+                    first_token_at - transcription_complete_at,
+                )
 
-        self._set_state("SPEAKING")
+        def first_sentence() -> None:
+            nonlocal first_sentence_at
+            if first_sentence_at is None:
+                first_sentence_at = time.perf_counter()
+                if first_token_at is not None:
+                    logger.info(
+                        "[PERF] First sentence: %.2fs",
+                        first_sentence_at - first_token_at,
+                    )
+
+        def playback_start() -> None:
+            nonlocal first_audio_at
+            if first_audio_at is None:
+                first_audio_at = time.perf_counter()
+                self._set_state("SPEAKING")
+                if first_sentence_at is not None:
+                    logger.info(
+                        "[PERF] TTS start: %.2fs",
+                        first_audio_at - first_sentence_at,
+                    )
+
+        pipeline = ResponsePipeline(
+            text,
+            self._stop_event,
+            self.player,
+            first_token,
+            first_sentence,
+            playback_start,
+            self._report_recoverable_error,
+        )
+        self._pipeline = pipeline
         try:
-            self.player.speak(response, self._stop_event)
-        except TTSError as exc:
-            self._report_recoverable_error(exc)
-            self._wait_or_stop(0.75)
+            pipeline.start()
+            pipeline.wait()
+            if not self._stop_event.is_set():
+                if pipeline.generation_error is not None:
+                    self._wait_or_stop(0.75)
+                elif not pipeline.response.strip():
+                    logger.error("Gemma returned empty response")
+                    self._set_state("ERROR")
+                    self._wait_or_stop(0.75)
+                elif (
+                    not pipeline.generation_finished.is_set()
+                    or not pipeline.tts_finished.is_set()
+                    or not pipeline.generation_succeeded
+                    or not pipeline.tts_succeeded
+                    or not pipeline.sentences.empty()
+                    or pipeline.sentences.unfinished_tasks != 0
+                ):
+                    logger.error(
+                        "Response pipeline incomplete: generation_finished=%s "
+                        "tts_finished=%s generation_ok=%s tts_ok=%s queue_empty=%s",
+                        pipeline.generation_finished.is_set(),
+                        pipeline.tts_finished.is_set(),
+                        pipeline.generation_succeeded,
+                        pipeline.tts_succeeded,
+                        pipeline.sentences.empty(),
+                    )
+                    self._set_state("ERROR")
+                    self._wait_or_stop(0.75)
+                else:
+                    logger.info(
+                        "[PERF] Total response: %.2fs",
+                        time.perf_counter() - transcription_complete_at,
+                    )
         finally:
+            self._pipeline = None
             if not self._stop_event.is_set():
                 self._set_state("LISTENING")
 
@@ -218,6 +476,7 @@ class VoiceController(QObject):
         return False
 
     def _report_recoverable_error(self, exc: Exception) -> None:
+        logger.error("%s", exc)
         self.error.emit(str(exc))
         self._set_state("ERROR")
 
@@ -242,14 +501,13 @@ class VoiceController(QObject):
 
 
 class ShutdownCoordinator(QObject):
-    """The single application-level shutdown entry point."""
+    """The single application-level shutdown coordinator."""
 
-    def __init__(self, app: QApplication, ui: DummyInterface, controller: VoiceController, thread: QThread):
+    def __init__(self, app: QApplication, ui: DummyInterface, controller: VoiceController):
         super().__init__()
         self.app = app
         self.ui = ui
         self.controller = controller
-        self.thread = thread
         self._lock = threading.Lock()
         self._started = False
 
@@ -275,7 +533,7 @@ def main() -> int:
     controller = VoiceController()
     thread = QThread()
     controller.moveToThread(thread)
-    coordinator = ShutdownCoordinator(app, ui, controller, thread)
+    coordinator = ShutdownCoordinator(app, ui, controller)
 
     def handle_qt_message(mode, context, message) -> None:
         if mode == QtMsgType.QtFatalMsg:
@@ -287,9 +545,7 @@ def main() -> int:
             logger.warning("Qt warning: %s", message)
 
     previous_qt_handler = qInstallMessageHandler(handle_qt_message)
-
     controller.state_changed.connect(ui.set_state, Qt.QueuedConnection)
-    controller.error.connect(lambda message: logger.error("Worker: %s", message), Qt.QueuedConnection)
     thread.started.connect(controller.run, Qt.QueuedConnection)
     controller.finished.connect(thread.quit, Qt.DirectConnection)
     controller.finished.connect(controller.deleteLater)
@@ -301,7 +557,6 @@ def main() -> int:
 
     previous_sigint = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, handle_sigint)
-
     previous_excepthook = sys.excepthook
 
     def handle_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
@@ -312,9 +567,6 @@ def main() -> int:
         coordinator.request("uncaught application error")
 
     sys.excepthook = handle_uncaught_exception
-
-    # If another Qt path requests application exit, use the same cancellation
-    # path. Normal shutdown calls app.quit only after the worker is finished.
     app.aboutToQuit.connect(lambda: coordinator.request("Qt application quit"))
 
     ui.show()
