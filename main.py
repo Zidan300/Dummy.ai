@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import queue
-import re
 import signal
 import sys
 import threading
@@ -13,7 +12,13 @@ import time
 from PySide6.QtCore import QObject, QThread, Qt, QtMsgType, Signal, qInstallMessageHandler
 from PySide6.QtWidgets import QApplication
 
-from ai import AIError, SentenceBuffer, stream_dummy
+from ai import (
+    AIError,
+    SentenceBuffer,
+    clean_for_speech,
+    stream_dummy,
+    unsupported_command_response,
+)
 from audio import (
     AudioCapture,
     AudioError,
@@ -21,6 +26,14 @@ from audio import (
     UtteranceDetector,
     VadError,
     WhisperTranscriber,
+)
+from context import (
+    ConversationContext,
+    EXIT_COMMANDS,
+    INTERRUPTION_COMMANDS,
+    classify_intent,
+    is_exit_command,
+    normalize_spoken_text,
 )
 from interface import DummyInterface
 from tts import SpeechPlayer, TTSError
@@ -40,17 +53,6 @@ STATES = {
     "SHUTTING_DOWN",
     "STOPPED",
 }
-
-EXIT_COMMANDS = {
-    "exit",
-    "quit",
-    "shutdown",
-    "shut down",
-    "goodbye",
-    "good bye",
-    "terminate",
-}
-
 
 class CombinedCancellation:
     """Event-like view that cancels on app shutdown or response interruption."""
@@ -77,6 +79,8 @@ class ResponsePipeline:
         on_playback_start,
         on_error,
         on_tts_finished=None,
+        history=None,
+        response_override: str | None = None,
     ) -> None:
         self.prompt = prompt
         self.stop_event = stop_event
@@ -88,6 +92,8 @@ class ResponsePipeline:
         self.on_playback_start = on_playback_start
         self.on_error = on_error
         self.on_tts_finished = on_tts_finished
+        self.history = list(history or ())
+        self.response_override = response_override
         self.sentences: queue.Queue[str | None] = queue.Queue(maxsize=self.QUEUE_SIZE)
         self.done = threading.Event()
         self.response = ""
@@ -148,7 +154,10 @@ class ResponsePipeline:
 
     def _generate(self) -> None:
         buffer = SentenceBuffer()
-        logger.info("Gemma generation started")
+        if self.response_override is None:
+            logger.info("Gemma generation started")
+        else:
+            logger.info("Local command response prepared")
 
         def receive_token(token: str) -> None:
             if self.is_cancelled():
@@ -165,11 +174,19 @@ class ResponsePipeline:
                 self._put_sentence(sentence)
 
         try:
-            self.response = stream_dummy(
-                self.prompt,
-                on_token=receive_token,
-                cancel_event=self._cancel_token,
-            )
+            if self.response_override is not None:
+                self.response = clean_for_speech(self.response_override)
+                if not self.is_cancelled() and self.response:
+                    receive_token(self.response)
+            else:
+                stream_kwargs = {
+                    "on_token": receive_token,
+                    "cancel_event": self._cancel_token,
+                }
+                if self.history:
+                    stream_kwargs["history"] = self.history
+                self.response = stream_dummy(self.prompt, **stream_kwargs)
+                self.response = clean_for_speech(self.response)
             if not self.is_cancelled():
                 for sentence in buffer.finish():
                     if not self._first_sentence_seen:
@@ -179,7 +196,8 @@ class ResponsePipeline:
                     self._put_sentence(sentence)
             if not self.is_cancelled():
                 self.generation_succeeded = True
-                logger.info("Gemma generation finished")
+                if self.response_override is None:
+                    logger.info("Gemma generation finished")
         except AIError as exc:
             self.generation_error = exc
             if not self.is_cancelled():
@@ -193,7 +211,7 @@ class ResponsePipeline:
             self.generation_finished.set()
 
     def _put_sentence(self, sentence: str) -> bool:
-        sentence = sentence.strip()
+        sentence = clean_for_speech(sentence)
         if not sentence:
             return False
         while not self.is_cancelled():
@@ -264,24 +282,6 @@ class ResponsePipeline:
         self._first_audio_started = True
         logger.info("TTS started")
         self.on_playback_start()
-
-
-INTERRUPTION_COMMANDS = {
-    "stop",
-    "stop talking",
-    "shut up",
-    "be quiet",
-    "quiet",
-    "cancel",
-    "never mind",
-    "that's enough",
-    "enough",
-    "pause",
-}
-
-
-def normalize_command(text: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", text.lower()))
 
 
 class BargeInMonitor:
@@ -381,7 +381,7 @@ class BargeInMonitor:
                         logger.error("Barge-in transcription failed: %s", exc)
                     continue
 
-                command = normalize_command(text)
+                command = normalize_spoken_text(text)
                 if command in INTERRUPTION_COMMANDS or command in EXIT_COMMANDS:
                     self.on_command(session_id, command)
                     return
@@ -402,6 +402,7 @@ class VoiceController(QObject):
         self._stop_event = threading.Event()
         self._state_lock = threading.Lock()
         self._state = "STARTING"
+        self.context = ConversationContext(max_turns=10)
         self.audio = AudioCapture()
         self.transcriber = WhisperTranscriber()
         self.detector: UtteranceDetector | None = None
@@ -427,6 +428,7 @@ class VoiceController(QObject):
         """Thread-safe, idempotent entry point for every shutdown path."""
         first_request = not self._stop_event.is_set()
         self._stop_event.set()
+        self.context.clear()
         self._set_state("SHUTTING_DOWN")
         if first_request:
             logger.info("Shutdown requested: %s", reason)
@@ -475,6 +477,7 @@ class VoiceController(QObject):
             self.error.emit(str(exc))
             self.request_shutdown("fatal voice worker error")
         finally:
+            self.context.clear()
             self._set_state("SHUTTING_DOWN")
             self.interrupt_tts()
             self._barge_monitor.stop()
@@ -546,10 +549,20 @@ class VoiceController(QObject):
             return
         logger.info("User: %s", text)
 
-        if self._is_exit_command(text):
+        intent = classify_intent(text)
+        if intent == "EXIT":
             logger.info("Voice exit command detected")
             self.request_shutdown("voice exit command")
             return
+        if intent == "INTERRUPTION":
+            logger.info("Interruption command ignored while listening")
+            self._set_state("LISTENING")
+            return
+
+        history = self.context.snapshot()
+        response_override = (
+            unsupported_command_response(text) if intent == "COMMAND" else None
+        )
 
         self._set_state("THINKING")
         with self._pipeline_lock:
@@ -622,6 +635,8 @@ class VoiceController(QObject):
             playback_start,
             self._report_recoverable_error,
             on_tts_finished=tts_finished,
+            history=history,
+            response_override=response_override,
         )
         with self._pipeline_lock:
             self._pipeline = pipeline
@@ -659,6 +674,7 @@ class VoiceController(QObject):
                     self._set_state("ERROR")
                     self._wait_or_stop(0.75)
                 else:
+                    self.context.append(text, pipeline.response)
                     logger.info(
                         "[PERF] Total response: %.2fs",
                         time.perf_counter() - transcription_complete_at,
@@ -725,8 +741,7 @@ class VoiceController(QObject):
 
     @staticmethod
     def _is_exit_command(text: str) -> bool:
-        normalized = re.sub(r"[.!?,;:]+$", "", text.lower().strip())
-        return normalized in EXIT_COMMANDS
+        return is_exit_command(text)
 
     def _set_state(self, state: str) -> None:
         state = state.upper()
