@@ -210,16 +210,22 @@ class VisualAnimator:
         idle_breath = math.sin(self.time * 1.35) * 0.035
         active_breath = math.sin(self.time * (2.0 + self.speed)) * 0.055 * self.energy * self._category_energy
         audio_reaction = self.voice_level * 0.55 * self.audio_coupling
-        return (idle_breath + active_breath + audio_reaction
+        voice_flutter = math.sin(self.time * 17.0 + 0.7) * self.voice_level * 0.018 * self.audio_coupling
+        thought_shift = math.sin(self.time * 0.73 + 1.8) * 0.025 * (self.state == "THINKING")
+        collapse = -self._interrupt_impulse * 0.22
+        return (idle_breath + active_breath + audio_reaction + voice_flutter + thought_shift
+                + collapse
                 + self._interrupt_impulse * 0.10 + self._activity_impulse * 0.08)
 
     @property
     def rotation(self) -> float:
-        return self.time * self.speed * self._category_speed * 18.0
+        drift = math.sin(self.time * 0.41) * 3.0
+        return self.time * self.speed * self._category_speed * 18.0 + drift
 
     @property
     def flow(self) -> float:
-        return self.time * (0.7 + self.speed * 1.8 * self._category_speed)
+        voice_flow = self.voice_level * 0.8 * self.audio_coupling
+        return self.time * (0.7 + self.speed * 1.8 * self._category_speed + voice_flow)
 
     @property
     def collapse(self) -> float:
@@ -227,11 +233,12 @@ class VisualAnimator:
 
     @property
     def core_radius_factor(self) -> float:
-        return 1.0 + self.pulse + self.voice_level * 0.10 * self.audio_coupling + self._conclusion_impulse * 0.06
+        vibration = math.sin(self.time * 21.0) * self.voice_level * 0.012 * self.audio_coupling
+        return 1.0 + self.pulse + vibration + self.voice_level * 0.10 * self.audio_coupling + self._conclusion_impulse * 0.06
 
     @property
     def wave_factor(self) -> float:
-        return self.wave + self.voice_level * 0.90 * self.audio_coupling
+        return self.wave + self.voice_level * (0.90 + 0.08 * math.sin(self.time * 11.0)) * self.audio_coupling
 
     @property
     def accent(self) -> tuple[int, int, int]:

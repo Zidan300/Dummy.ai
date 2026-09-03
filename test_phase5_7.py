@@ -90,7 +90,7 @@ class BlockingPlayer(FakePlayer):
 
 class CommandRegressionTests(unittest.TestCase):
     def test_stop_and_exit_are_distinct_exact_commands(self):
-        self.assertEqual(classify_intent("stop"), "INTERRUPTION")
+        self.assertEqual(classify_intent("stop"), "CONVERSATION")
         self.assertEqual(classify_intent("turn off"), "EXIT")
         self.assertTrue(is_interruption_command("stop talking."))
         self.assertTrue(is_exit_command("goodbye!"))

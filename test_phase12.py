@@ -1,14 +1,9 @@
-"""Phase 12 natural barge-in regression tests."""
+"""Phase 13 keyboard-only interruption regression tests."""
 
 from __future__ import annotations
 
-import threading
 import unittest
-from unittest.mock import patch
 
-import numpy as np
-
-from audio import BARGE_MIN_AUDIO_SECONDS, BargeInDetector, FRAME_SIZE
 from main import ResponsePipeline, VoiceController
 
 
@@ -28,91 +23,66 @@ class FakePlayer:
         self.cancelled = False
 
 
-class NaturalBargeInTests(unittest.TestCase):
-    def test_speech_onset_carries_preroll_to_callback(self):
-        class FakeVad:
-            def __init__(self, aggressiveness):
-                del aggressiveness
-                self.calls = 0
-
-            def is_speech(self, raw, sample_rate):
-                del raw, sample_rate
-                self.calls += 1
-                return self.calls >= 3
-
-        class Capture:
-            def __init__(self):
-                self.frames = [np.full(FRAME_SIZE, 1024, dtype=np.int16) for _ in range(14)]
-
-            def drain_events(self):
-                return []
-
-            def is_active(self):
-                return True
-
-            def is_healthy(self):
-                return True
-
-            def read_frame(self, timeout=0.2):
-                del timeout
-                return self.frames.pop(0)
-
-        detected = []
-        with patch("audio.webrtcvad.Vad", FakeVad):
-            BargeInDetector().listen_for_segments(
-                Capture(),
-                threading.Event(),
-                on_segment=lambda audio, paused: detected.append((audio, paused)) or True,
-                on_speech_detected=lambda audio: detected.append(("onset", audio)),
-            )
-
-        self.assertEqual(detected[0][0], "onset")
-        self.assertGreaterEqual(len(detected[0][1]), FRAME_SIZE * 4)
-
-    def test_natural_barge_in_cancels_and_restarts_normal_listener(self):
+class KeyboardInterruptionTests(unittest.TestCase):
+    def _controller_with_pipeline(self, state):
         controller = VoiceController()
-        player = FakePlayer()
+        controller._set_state(state)
         pipeline = ResponsePipeline(
             "old request",
             controller.stop_event,
-            player,
+            FakePlayer(),
             lambda: None,
             lambda: None,
             lambda: None,
             lambda exc: None,
         )
-        seed = np.ones(FRAME_SIZE * 3, dtype=np.float32) * 0.1
-        started = []
-
-        class FakeNormalMonitor:
-            def reset(self):
-                pass
-
-            def start(self, initial_audio=None, detected_at=None):
-                started.append((initial_audio, detected_at))
-
-        controller.player = player
-        controller._normal_monitor = FakeNormalMonitor()
         with controller._pipeline_lock:
             controller._pipeline = pipeline
-            controller._active_session_id = 12
+            controller._active_session_id = 1
+        return controller, pipeline
 
-        with patch.object(controller, "interrupt_tts", wraps=controller.interrupt_tts) as interrupt:
-            controller._handle_natural_barge_in(12, seed)
-
-        self.assertTrue(interrupt.called)
+    def test_s_key_interrupts_speaking(self):
+        controller, pipeline = self._controller_with_pipeline("SPEAKING")
+        controller.keyboard_interrupt()
         self.assertTrue(pipeline.is_cancelled())
-        self.assertTrue(player.cancelled)
-        self.assertIsNone(controller._pipeline)
-        self.assertIsNone(controller._active_session_id)
         self.assertEqual(controller._state, "LISTENING")
-        self.assertEqual(len(started), 1)
-        np.testing.assert_array_equal(started[0][0], seed)
-        self.assertIsNotNone(started[0][1])
+        self.assertIsNone(controller._active_session_id)
 
-    def test_barge_threshold_is_short_but_not_a_single_frame(self):
-        self.assertGreaterEqual(BARGE_MIN_AUDIO_SECONDS, 0.09)
-        self.assertGreaterEqual(BARGE_MIN_AUDIO_SECONDS, 3 * 0.03)
+    def test_s_key_interrupts_thinking(self):
+        controller, pipeline = self._controller_with_pipeline("THINKING")
+        controller.keyboard_interrupt()
+        self.assertTrue(pipeline.is_cancelled())
+
+    def test_s_key_does_nothing_when_not_processing(self):
+        for state in ("STARTING", "IDLE", "LISTENING", "SHUTTING_DOWN"):
+            controller = VoiceController()
+            controller._set_state(state)
+            controller.keyboard_interrupt()
+            self.assertEqual(controller._state, state)
+
+    def test_repeated_s_key_is_safe(self):
+        controller, pipeline = self._controller_with_pipeline("SPEAKING")
+        controller.keyboard_interrupt()
+        controller.keyboard_interrupt()
+        self.assertTrue(pipeline.is_cancelled())
+        self.assertEqual(controller._state, "LISTENING")
+
+    def test_shutdown_is_idempotent_after_interrupt(self):
+        controller, pipeline = self._controller_with_pipeline("SPEAKING")
+        controller.keyboard_interrupt()
+        controller.request_shutdown("test")
+        controller.request_shutdown("test again")
+        self.assertTrue(pipeline.is_cancelled())
+        self.assertTrue(controller.stop_event.is_set())
+        self.assertEqual(controller._state, "SHUTTING_DOWN")
+
+    def test_automatic_monitor_is_disabled(self):
+        controller = VoiceController()
+        self.assertFalse(hasattr(controller._barge_monitor, "start"))
+
+    def test_controller_keeps_one_persistent_microphone(self):
+        controller = VoiceController()
+        self.assertIsNotNone(controller.audio)
 
 
 if __name__ == "__main__":

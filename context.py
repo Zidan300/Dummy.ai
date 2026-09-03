@@ -103,8 +103,6 @@ def classify_intent(text: str) -> str:
         return "CONVERSATION"
     if normalized in EXIT_COMMANDS:
         return "EXIT"
-    if normalized in INTERRUPTION_COMMANDS:
-        return "INTERRUPTION"
     if normalized in CONVERSATIONAL_EXACT:
         return "CONVERSATION"
 

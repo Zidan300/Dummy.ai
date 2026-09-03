@@ -49,8 +49,8 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(classify_intent("how are you?"), "CONVERSATION")
         self.assertEqual(classify_intent("open Safari"), "COMMAND")
         self.assertEqual(classify_intent("launch Spotify"), "COMMAND")
-        self.assertEqual(classify_intent("stop"), "INTERRUPTION")
-        self.assertEqual(classify_intent("cancel that"), "INTERRUPTION")
+        self.assertEqual(classify_intent("stop"), "CONVERSATION")
+        self.assertEqual(classify_intent("cancel that"), "CONVERSATION")
         self.assertEqual(classify_intent("goodbye"), "EXIT")
         self.assertEqual(classify_intent("turn off"), "EXIT")
 

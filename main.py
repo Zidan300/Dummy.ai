@@ -20,15 +20,7 @@ from ai import (
     stream_dummy,
     unsupported_command_response,
 )
-from audio import (
-    AudioCapture,
-    AudioError,
-    BargeInDetector,
-    TranscriptionError,
-    UtteranceDetector,
-    VadError,
-    WhisperTranscriber,
-)
+from audio import AudioCapture, AudioError, TranscriptionError, UtteranceDetector, VadError, WhisperTranscriber
 from context import (
     ConversationContext,
     EXIT_COMMANDS,
@@ -76,6 +68,37 @@ class ConditionalCancellation:
 
     def is_set(self) -> bool:
         return any(event.is_set() for event in self._events) or not self._allowed()
+
+
+class DisabledBargeMonitor:
+    """Compatibility shim; automatic microphone interruption is disabled."""
+
+    def stop(self, session_id=None) -> None:
+        del session_id
+
+    def reset(self) -> None:
+        pass
+
+    def _recognize_segment(self, session_id, audio, cancel, pause_confirmed=False) -> bool:
+        del session_id, audio, cancel, pause_confirmed
+        return False
+
+
+class BargeInMonitor(DisabledBargeMonitor):
+    """Legacy test adapter; it never starts an automatic monitor."""
+
+    def __init__(self, capture=None, transcriber=None, app_stop_event=None, on_command=None):
+        self.transcriber = transcriber
+        self.on_command = on_command
+
+    def _recognize_segment(self, session_id, audio, cancel, pause_confirmed=False) -> bool:
+        if cancel.is_set():
+            return True
+        text = normalize_spoken_text(self.transcriber.transcribe(audio, cancel))
+        if pause_confirmed and (text in INTERRUPTION_COMMANDS or text in EXIT_COMMANDS):
+            self.on_command(session_id, text)
+            return True
+        return False
 
 
 class PerformanceTimeline:
@@ -497,137 +520,6 @@ class NormalSpeechMonitor:
                 self.on_error(exc)
 
 
-class BargeInMonitor:
-    """Detect confident human speech while a response is being produced."""
-
-    SPEAKER_START_GUARD_SECONDS = 0.45
-    CONSUMER = "barge"
-
-    def __init__(self, capture, transcriber, app_stop_event, on_command, on_speech_started=None) -> None:
-        self.capture = capture
-        self.transcriber = transcriber
-        self.app_stop_event = app_stop_event
-        self.on_command = on_command
-        self.on_speech_started = on_speech_started
-        self._lock = threading.RLock()
-        self._thread: threading.Thread | None = None
-        self._stop_event: threading.Event | None = None
-        self._session_id: int | None = None
-        self._guard_until = 0.0
-        register = getattr(self.capture, "register_consumer", None)
-        if register is not None:
-            register(self.CONSUMER)
-
-    def start(self, session_id: int) -> None:
-        self.stop()
-        self.capture.clear_pending_frames()
-        local_stop = threading.Event()
-        with self._lock:
-            self._session_id = session_id
-            self._stop_event = local_stop
-            self._guard_until = 0.0
-            self._thread = threading.Thread(
-                target=self._run,
-                args=(session_id, local_stop),
-                name=f"dummy-barge-in-{session_id}",
-                daemon=False,
-            )
-            thread = self._thread
-        thread.start()
-
-    def set_playback_guard(self, session_id: int) -> None:
-        with self._lock:
-            if self._session_id != session_id:
-                return
-            self._guard_until = time.monotonic() + self.SPEAKER_START_GUARD_SECONDS
-        self.capture.clear_pending_frames()
-
-    def request_stop(self, session_id: int) -> None:
-        with self._lock:
-            if self._session_id == session_id and self._stop_event is not None:
-                self._stop_event.set()
-
-    def stop(self, session_id: int | None = None) -> None:
-        with self._lock:
-            if session_id is not None and self._session_id != session_id:
-                return
-            stop_event = self._stop_event
-            thread = self._thread
-        if stop_event is not None:
-            stop_event.set()
-        if thread is not None and thread is not threading.current_thread():
-            thread.join()
-        with self._lock:
-            if self._thread is thread:
-                self._thread = None
-                self._stop_event = None
-                self._session_id = None
-
-    def _run(self, session_id: int, local_stop: threading.Event) -> None:
-        cancel = CombinedCancellation(self.app_stop_event, local_stop)
-        try:
-            detector = BargeInDetector()
-            while not cancel.is_set():
-                try:
-                    detector.listen_for_segments(
-                        self.capture,
-                        cancel,
-                        on_speech_detected=lambda audio: self._speech_started(session_id, audio),
-                        on_segment=lambda audio, pause_confirmed: self._recognize_segment(
-                            session_id,
-                            audio,
-                            cancel,
-                            pause_confirmed=pause_confirmed,
-                        ),
-                        ignore_until=lambda: self._guard_until_for(session_id),
-                        consumer=self.CONSUMER,
-                    )
-                except (AudioError, VadError) as exc:
-                    if not cancel.is_set():
-                        logger.error("[BARGE] monitor failed: %s", exc)
-                    return
-                if cancel.is_set():
-                    return
-        except Exception as exc:
-            if not cancel.is_set():
-                logger.exception("[BARGE] worker failed: %s", exc)
-
-    def _speech_started(self, session_id: int, audio) -> None:
-        logger.info("[BARGE] confirmed human speech")
-        if self.on_speech_started:
-            self.on_speech_started(session_id, audio)
-
-    def _recognize_segment(
-        self,
-        session_id: int,
-        audio,
-        cancel,
-        pause_confirmed: bool = False,
-    ) -> bool:
-        if cancel.is_set():
-            return True
-        logger.info("[BARGE] recognition started")
-        try:
-            text = self.transcriber.transcribe(audio, cancel)
-        except TranscriptionError as exc:
-            if not cancel.is_set():
-                logger.error("[BARGE] transcription failed: %s", exc)
-            return False
-
-        command = normalize_spoken_text(text)
-        is_control = command in INTERRUPTION_COMMANDS or command in EXIT_COMMANDS
-        if is_control and pause_confirmed:
-            self.on_command(session_id, command)
-            return True
-        return False
-
-    def _guard_until_for(self, session_id: int) -> float:
-        with self._lock:
-            if self._session_id != session_id:
-                return time.monotonic()
-            return self._guard_until
-
-
 class VoiceController(QObject):
     """The Qt worker owning the continuous voice loop."""
 
@@ -669,13 +561,7 @@ class VoiceController(QObject):
         self._interrupted_session_id: int | None = None
         self._interruption_started_at: float | None = None
         self._tts_cooldown_until: float = 0.0
-        self._barge_monitor = BargeInMonitor(
-            self.audio,
-            self.transcriber,
-            self._stop_event,
-            self._handle_barge_in,
-            self._handle_natural_barge_in,
-        )
+        self._barge_monitor = DisabledBargeMonitor()
         self._normal_monitor: NormalSpeechMonitor | None = None
 
     @property
@@ -692,7 +578,6 @@ class VoiceController(QObject):
         if first_request:
             logger.info("Shutdown requested: %s", reason)
         self.interrupt_tts()
-        self._barge_monitor.stop()
         self.audio.stop()
 
     def interrupt_tts(
@@ -707,29 +592,21 @@ class VoiceController(QObject):
         if session_id is not None and active_session_id != session_id:
             return
 
-        barge = session_id is not None
         if pipeline is not None:
             pipeline.cancel()
             if not pipeline.generation_finished.is_set():
-                logger.info("%sGemma cancellation requested", "[BARGE] " if barge else "")
-            logger.info("%sTTS queue cleared", "[BARGE] " if barge else "")
+                logger.info("Gemma cancellation requested")
+            logger.info("TTS queue cleared")
         if self.player.cancel():
-            logger.info("%sffplay terminated", "[BARGE] " if barge else "")
+            logger.info("ffplay terminated")
         self.audio.clear_pending_frames()
-        if barge:
-            if self._normal_monitor is not None:
-                self._normal_monitor.reset()
-            self._clear_queued_utterances()
-            logger.info("[BARGE] microphone buffer cleared")
+        if self._normal_monitor is not None:
+            self._normal_monitor.reset()
+        self._clear_queued_utterances()
+        logger.info("microphone and utterance buffers cleared")
         if detected_at is not None:
-            logger.info(
-                "[BARGE] interruption latency: %.0f ms",
-                (time.perf_counter() - detected_at) * 1000.0,
-            )
-            logger.info(
-                "[PERF] Barge-in response: %.2fs",
-                time.perf_counter() - detected_at,
-            )
+            logger.info("[PERF] key_interrupt_to_playback_stop: %.0f ms",
+                        (time.perf_counter() - detected_at) * 1000.0)
 
     def run(self) -> None:
         try:
@@ -766,7 +643,6 @@ class VoiceController(QObject):
             self.interrupt_tts()
             if self._normal_monitor is not None:
                 self._normal_monitor.stop()
-            self._barge_monitor.stop()
             with self._pipeline_lock:
                 active_pipeline = self._pipeline
             if active_pipeline is not None:
@@ -947,12 +823,6 @@ class VoiceController(QObject):
             self.request_shutdown("voice exit command")
             self._processing_done()
             return
-        if intent == "INTERRUPTION":
-            logger.info("Interruption command ignored while listening")
-            self._set_state("LISTENING")
-            self._processing_done()
-            return
-
         history = self.context.snapshot()
         response_override = local_reference_response(text, history)
         if response_override is None and intent == "COMMAND":
@@ -994,7 +864,6 @@ class VoiceController(QObject):
                     return
                 if "playback_started" not in timeline.marks:
                     timeline.mark("playback_started")
-                    self._barge_monitor.set_playback_guard(session_id)
                     self._set_state("SPEAKING")
                     self.tts_started.emit()
 
@@ -1017,7 +886,6 @@ class VoiceController(QObject):
             with self._pipeline_lock:
                 current = self._pipeline is pipeline and self._active_session_id == session_id
             if current:
-                self._barge_monitor.request_stop(session_id)
                 self.tts_finished.emit()
 
         def pipeline_error(exc: Exception) -> None:
@@ -1054,7 +922,6 @@ class VoiceController(QObject):
             self._pipeline = pipeline
             self._active_session_id = session_id
         try:
-            self._barge_monitor.start(session_id)
             pipeline.start()
             self._processing_done()
         except Exception:
@@ -1114,7 +981,6 @@ class VoiceController(QObject):
                     timeline.elapsed("speech_finished", "response_finished") or 0.0,
                 )
 
-        self._barge_monitor.stop(session_id)
         with self._pipeline_lock:
             owns_session = self._pipeline is pipeline
             if owns_session:
@@ -1136,56 +1002,28 @@ class VoiceController(QObject):
             if interrupted:
                 logger.info("[BARGE] LISTENING")
 
-    def _handle_barge_in(self, session_id: int, command: str) -> None:
+    def keyboard_interrupt(self) -> None:
+        """Cancel only an active THINKING or SPEAKING response."""
         detected_at = time.perf_counter()
-        with self._pipeline_lock:
-            pipeline = self._pipeline
-            if (
-                self._active_session_id != session_id
-                or pipeline is None
-                or pipeline.is_cancelled()
-                or self._interrupted_session_id == session_id
-            ):
-                return
-            self._interrupted_session_id = session_id
-            self._interruption_started_at = detected_at
-            logger.info("[BARGE] session invalidated")
-
-        logger.info('[BARGE] recognized: "%s"', command)
-        if command in EXIT_COMMANDS:
-            self.request_shutdown("voice exit command during response")
+        with self._state_lock:
+            state = self._state
+        if state not in {"THINKING", "SPEAKING"} or self._stop_event.is_set():
             return
-        logger.info("[BARGE] interruption confirmed")
-        self.interrupt_tts(session_id, detected_at)
-        self._barge_monitor.request_stop(session_id)
-        with self._pipeline_lock:
-            if self._active_session_id == session_id:
-                self._active_session_id = None
-            if self._pipeline is pipeline:
-                self._pipeline = None
-        self._tts_cooldown_until = 0.0
-        self.interrupted.emit()
-        self._set_state("INTERRUPTED")
-        self._set_state("LISTENING")
-
-    def _handle_natural_barge_in(self, session_id: int, initial_audio) -> None:
-        """Stop the response on speech onset, then preserve that speech."""
-        detected_at = time.perf_counter()
         with self._pipeline_lock:
             pipeline = self._pipeline
             if (
-                self._active_session_id != session_id
-                or pipeline is None
+                pipeline is None
                 or pipeline.is_cancelled()
-                or self._interrupted_session_id == session_id
             ):
+                return
+            session_id = self._active_session_id
+            if session_id is None:
                 return
             self._interrupted_session_id = session_id
             self._interruption_started_at = detected_at
 
-        logger.info("[BARGE] natural interruption; invalidating session %s", session_id)
+        logger.info("S key interrupt; invalidating session %s", session_id)
         self.interrupt_tts(session_id, detected_at)
-        self._barge_monitor.request_stop(session_id)
         with self._pipeline_lock:
             if self._active_session_id == session_id:
                 self._active_session_id = None
@@ -1195,13 +1033,27 @@ class VoiceController(QObject):
         self.interrupted.emit()
         self._set_state("INTERRUPTED")
         self._set_state("LISTENING")
-        if self._normal_monitor is not None and not self._stop_event.is_set():
-            self._normal_monitor.start(
-                initial_audio=initial_audio,
-                detected_at=detected_at,
-            )
-        logger.info("[PERF] barge_in_to_playback_stop: %.0f ms",
+        logger.info("[PERF] key_interrupt_to_playback_stop: %.0f ms",
                     (time.perf_counter() - detected_at) * 1000.0)
+
+    def _handle_barge_in(self, session_id: int, command: str) -> None:
+        """Compatibility hook retained for older callers; never auto-wired."""
+        with self._pipeline_lock:
+            pipeline = self._pipeline
+            if self._active_session_id != session_id or pipeline is None:
+                return
+            self._interrupted_session_id = session_id
+        if command in EXIT_COMMANDS:
+            self.request_shutdown("voice exit command")
+            return
+        self.interrupt_tts(session_id, time.perf_counter())
+        with self._pipeline_lock:
+            self._pipeline = None
+            self._active_session_id = None
+        self._tts_cooldown_until = 0.0
+        self.interrupted.emit()
+        self._set_state("INTERRUPTED")
+        self._set_state("LISTENING")
 
     def _recover_microphone(self) -> bool:
         self._set_state("ERROR")
@@ -1218,8 +1070,6 @@ class VoiceController(QObject):
                 )
                 with self._pipeline_lock:
                     active_session_id = self._active_session_id
-                if active_session_id is not None and not self._stop_event.is_set():
-                    self._barge_monitor.start(active_session_id)
                 self._set_state("LISTENING")
                 return True
             except AudioError as exc:
@@ -1262,10 +1112,17 @@ class ShutdownCoordinator(QObject):
         self.controller = controller
         self._lock = threading.Lock()
         self._started = False
+        self._controller_finished = False
+
+    def mark_controller_finished(self) -> None:
+        with self._lock:
+            self._controller_finished = True
 
     def request(self, reason: str) -> None:
         with self._lock:
             if self._started:
+                return
+            if self._controller_finished:
                 return
             self._started = True
         self.controller.request_shutdown(reason)
@@ -1308,9 +1165,10 @@ def main() -> int:
     controller.first_token.connect(ui.note_first_token, Qt.QueuedConnection)
     controller.first_sentence.connect(ui.note_first_sentence, Qt.QueuedConnection)
     controller.interrupted.connect(ui.note_interrupted, Qt.QueuedConnection)
+    ui.interrupt_requested.connect(controller.keyboard_interrupt, Qt.QueuedConnection)
     thread.started.connect(controller.run, Qt.QueuedConnection)
     controller.finished.connect(thread.quit, Qt.DirectConnection)
-    controller.finished.connect(controller.deleteLater)
+    controller.finished.connect(coordinator.mark_controller_finished, Qt.DirectConnection)
     thread.finished.connect(coordinator.finish)
     ui.close_requested.connect(lambda: coordinator.request("window close"))
 

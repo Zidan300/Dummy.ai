@@ -32,6 +32,7 @@ class DummyInterface(QWidget):
     """A single QWidget owned by Qt's GUI thread."""
 
     close_requested = Signal()
+    interrupt_requested = Signal()
 
     BACKGROUND = QColor(4, 7, 14)
     TEXT = QColor(232, 239, 251)
@@ -42,6 +43,7 @@ class DummyInterface(QWidget):
         self.setWindowTitle("DUMMY")
         self.resize(1000, 700)
         self.setMinimumSize(720, 560)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAutoFillBackground(False)
 
@@ -79,6 +81,13 @@ class DummyInterface(QWidget):
         else:
             event.ignore()
             self.close_requested.emit()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_S and not event.isAutoRepeat():
+            self.interrupt_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # -- Qt-thread-safe signal slots (GUI thread only) ----------------------
     def set_state(self, state: str) -> None:

@@ -172,7 +172,7 @@ class SelfTalkPreventionTests(unittest.TestCase):
             while controller._pipeline is not None and time.monotonic() < deadline:
                 time.sleep(0.01)
 
-        self.assertEqual(seen, [], "STOP must never be sent to Gemma")
+        self.assertEqual(seen, ["stop"], "Voice STOP is normal speech; S key is the interrupt")
 
     def test_cancel_interrupts(self):
         controller = VoiceController()
@@ -265,7 +265,7 @@ class SelfTalkPreventionTests(unittest.TestCase):
         controller._handle_barge_in(1, "stop")
         self.assertTrue(pipeline1.is_cancelled())
 
-        controller._next_session_id += 1
+        controller._next_session_id += 2
         session2 = controller._next_session_id
         pipeline2 = ResponsePipeline(
             "test2",
