@@ -13,7 +13,7 @@ from unittest.mock import patch
 import numpy as np
 
 from animations import VisualAnimator
-from audio import AudioCapture, BargeInDetector, FRAME_SIZE
+from audio import AudioCapture, BargeInDetector, FRAME_SIZE, UtteranceDetector
 from context import (
     classify_intent,
     classify_question_category,
@@ -225,6 +225,8 @@ class CommandRegressionTests(unittest.TestCase):
             lambda exc: self.fail(f"normal monitor error: {exc}"),
             lambda timeline: None,
             lambda timeline: None,
+            lambda: True,
+            lambda info: None,
         )
         monitor.start()
         self.assertTrue(started.wait(1.0))
@@ -232,6 +234,47 @@ class CommandRegressionTests(unittest.TestCase):
         self.assertTrue(monitor.is_alive())
         monitor.stop()
         self.assertFalse(monitor.is_alive())
+
+    def test_normal_utterance_is_rejected_during_speaking(self):
+        controller = VoiceController()
+        controller._set_state("SPEAKING")
+        controller._queue_normal_utterance(
+            np.ones(480, dtype=np.float32),
+            PerformanceTimeline(),
+        )
+        self.assertEqual(controller._utterances.qsize(), 0)
+
+    def test_silence_does_not_create_a_normal_utterance(self):
+        class SilentVad:
+            def is_speech(self, raw, sample_rate):
+                del raw, sample_rate
+                return False
+
+        class Capture:
+            def __init__(self, stop_event):
+                self.stop_event = stop_event
+                self.frames = 0
+
+            def drain_events(self):
+                return []
+
+            def is_active(self):
+                return True
+
+            def is_healthy(self):
+                return True
+
+            def read_frame(self, timeout=0.2):
+                del timeout
+                self.frames += 1
+                if self.frames >= 8:
+                    self.stop_event.set()
+                return np.zeros(FRAME_SIZE, dtype=np.int16)
+
+        stop_event = threading.Event()
+        detector = UtteranceDetector.__new__(UtteranceDetector)
+        detector._vad = SilentVad()
+        self.assertIsNone(detector.listen(Capture(stop_event), stop_event))
 
 
 class PerformanceRegressionTests(unittest.TestCase):
@@ -354,6 +397,20 @@ class ResponsePipelineRegressionTests(unittest.TestCase):
 
     def test_controller_does_not_block_on_response_playback(self):
         controller = VoiceController()
+        class NoopBargeMonitor:
+            def start(self, session_id):
+                del session_id
+
+            def stop(self, session_id=None):
+                del session_id
+
+            def set_playback_guard(self, session_id):
+                del session_id
+
+            def request_stop(self, session_id):
+                del session_id
+
+        controller._barge_monitor = NoopBargeMonitor()
         controller.transcriber = type(
             "FakeTranscriber",
             (),

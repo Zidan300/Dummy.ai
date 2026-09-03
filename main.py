@@ -67,6 +67,17 @@ class CombinedCancellation:
         return any(event.is_set() for event in self._events)
 
 
+class ConditionalCancellation:
+    """Event-like cancellation that also pauses a detector when gated off."""
+
+    def __init__(self, events, allowed) -> None:
+        self._events = events
+        self._allowed = allowed
+
+    def is_set(self) -> bool:
+        return any(event.is_set() for event in self._events) or not self._allowed()
+
+
 class PerformanceTimeline:
     """Monotonic, per-utterance timing marks for the voice pipeline."""
 
@@ -370,7 +381,7 @@ class NormalSpeechMonitor:
 
     CONSUMER = "normal"
 
-    def __init__(self, capture, detector, app_stop_event, on_utterance, on_error, on_speech_started, on_speech_ended):
+    def __init__(self, capture, detector, app_stop_event, on_utterance, on_error, on_speech_started, on_speech_ended, can_listen, on_utterance_info):
         self.capture = capture
         self.detector = detector
         self.app_stop_event = app_stop_event
@@ -378,6 +389,8 @@ class NormalSpeechMonitor:
         self.on_error = on_error
         self.on_speech_started = on_speech_started
         self.on_speech_ended = on_speech_ended
+        self.can_listen = can_listen
+        self.on_utterance_info = on_utterance_info
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
@@ -425,8 +438,19 @@ class NormalSpeechMonitor:
     def _run(self, local_stop: threading.Event) -> None:
         try:
             while not self.app_stop_event.is_set() and not local_stop.is_set():
+                if not self.can_listen():
+                    clear_consumer = getattr(self.capture, "clear_consumer", None)
+                    if clear_consumer is not None:
+                        clear_consumer(self.CONSUMER)
+                    else:
+                        self.capture.clear_pending_frames()
+                    local_stop.wait(0.03)
+                    continue
                 self._reset_event.clear()
-                cancel = CombinedCancellation(self.app_stop_event, local_stop, self._reset_event)
+                cancel = ConditionalCancellation(
+                    (self.app_stop_event, local_stop, self._reset_event),
+                    self.can_listen,
+                )
                 timeline = PerformanceTimeline()
 
                 def speech_started() -> None:
@@ -440,6 +464,7 @@ class NormalSpeechMonitor:
                         cancel,
                         on_speech_detected=speech_started,
                         consumer=self.CONSUMER,
+                        on_utterance_info=self.on_utterance_info,
                     )
                 except (AudioError, VadError) as exc:
                     if cancel.is_set():
@@ -586,9 +611,12 @@ class BargeInMonitor:
 class VoiceController(QObject):
     """The Qt worker owning the continuous voice loop."""
 
+    TTS_COOLDOWN_SECONDS = 0.50
+
     state_changed = Signal(str)
     audio_level = Signal(float)
     question_category = Signal(str)
+    intent_changed = Signal(str)
     speech_started = Signal()
     speech_ended = Signal()
     thinking_started = Signal()
@@ -620,6 +648,7 @@ class VoiceController(QObject):
         self._active_session_id: int | None = None
         self._interrupted_session_id: int | None = None
         self._interruption_started_at: float | None = None
+        self._tts_cooldown_until: float = 0.0
         self._barge_monitor = BargeInMonitor(
             self.audio,
             self.transcriber,
@@ -638,6 +667,7 @@ class VoiceController(QObject):
         self._stop_event.set()
         self.context.clear()
         self._set_state("SHUTTING_DOWN")
+        self._tts_cooldown_until = 0.0
         if first_request:
             logger.info("Shutdown requested: %s", reason)
         self.interrupt_tts()
@@ -748,6 +778,8 @@ class VoiceController(QObject):
                         self._normal_monitor_error,
                         self._normal_speech_started,
                         self._normal_speech_ended,
+                        self._normal_detector_allowed,
+                        self._normal_utterance_info,
                     )
                 if not self.transcriber.ready:
                     self.transcriber.load()
@@ -760,12 +792,51 @@ class VoiceController(QObject):
         return False
 
     def _normal_speech_started(self, timeline: PerformanceTimeline) -> None:
-        del timeline
+        with self._state_lock:
+            state = self._state
+        with self._pipeline_lock:
+            session_id = self._active_session_id
+        logger.info(
+            "[NORMAL] speech started state=%s playback_active=%s session=%s",
+            state,
+            state == "SPEAKING",
+            session_id,
+        )
         self.speech_started.emit()
 
     def _normal_speech_ended(self, timeline: PerformanceTimeline) -> None:
-        del timeline
+        logger.info("[NORMAL] speech ended")
         self.speech_ended.emit()
+
+    def _normal_utterance_info(self, info: dict[str, float]) -> None:
+        with self._state_lock:
+            state = self._state
+        with self._pipeline_lock:
+            session_id = self._active_session_id
+        logger.info(
+            "[VAD] utterance at=%.3f audio=%.2fs rms=%.4f vad=%.2fs "
+            "prebuffer=%d state=%s playback_active=%s session=%s",
+            time.monotonic(),
+            info["audio_seconds"],
+            info["rms"],
+            info["vad_speech_seconds"],
+            int(info["prebuffer_frames"]),
+            state,
+            state == "SPEAKING",
+            session_id,
+        )
+
+    def _normal_detector_allowed(self) -> bool:
+        with self._state_lock:
+            state = self._state
+        with self._pipeline_lock:
+            return (
+                not self._stop_event.is_set()
+                and state in {"IDLE", "LISTENING"}
+                and self._pipeline is None
+                and self._active_session_id is None
+                and not self._processing
+            )
 
     def _normal_monitor_error(self, exc: Exception) -> None:
         if self._stop_event.is_set():
@@ -774,15 +845,12 @@ class VoiceController(QObject):
         self._report_recoverable_error(exc)
 
     def _queue_normal_utterance(self, utterance, timeline: PerformanceTimeline) -> None:
-        with self._pipeline_lock:
-            accepting = (
-                not self._stop_event.is_set()
-                and self._pipeline is None
-                and self._active_session_id is None
-                and not self._processing
-            )
-        if not accepting:
-            logger.debug("Discarding speech while a response is active")
+        if not self._normal_detector_allowed():
+            logger.info("[NORMAL] utterance discarded by state gate")
+            return
+        if time.monotonic() < self._tts_cooldown_until:
+            logger.info("[NORMAL] utterance discarded by TTS cooldown")
+            self._clear_consumer("normal")
             return
         try:
             self._utterances.put_nowait((utterance, timeline))
@@ -805,6 +873,11 @@ class VoiceController(QObject):
                 self._utterances.task_done()
             except queue.Empty:
                 return
+
+    def _clear_consumer(self, name: str) -> None:
+        clear_fn = getattr(self.audio, "clear_consumer", None)
+        if clear_fn is not None:
+            clear_fn(name)
 
     def _processing_done(self) -> None:
         with self._pipeline_lock:
@@ -865,6 +938,7 @@ class VoiceController(QObject):
             response_override = unsupported_command_response(text)
 
         self.question_category.emit(classify_question_category(text))
+        self.intent_changed.emit(intent)
         self._set_state("THINKING")
         self.thinking_started.emit()
         with self._pipeline_lock:
@@ -1032,6 +1106,11 @@ class VoiceController(QObject):
                     self.player.reset_cancellation()
                 except TTSError:
                     logger.exception("Could not reset TTS cancellation state")
+                self._tts_cooldown_until = (
+                    time.monotonic() + self.TTS_COOLDOWN_SECONDS
+                )
+                self._clear_consumer("normal")
+                logger.info("[NORMAL] TTS cooldown activated for %.2fs", self.TTS_COOLDOWN_SECONDS)
                 self._set_state("LISTENING")
             if interrupted:
                 logger.info("[BARGE] LISTENING")
@@ -1063,6 +1142,7 @@ class VoiceController(QObject):
                 self._active_session_id = None
             if self._pipeline is pipeline:
                 self._pipeline = None
+        self._tts_cooldown_until = 0.0
         self.interrupted.emit()
         self._set_state("INTERRUPTED")
         self._set_state("LISTENING")
@@ -1164,6 +1244,10 @@ def main() -> int:
     controller.state_changed.connect(ui.set_state, Qt.QueuedConnection)
     controller.audio_level.connect(ui.set_audio_level, Qt.QueuedConnection)
     controller.question_category.connect(ui.set_question_category, Qt.QueuedConnection)
+    controller.intent_changed.connect(ui.set_intent, Qt.QueuedConnection)
+    controller.speech_started.connect(ui.note_speech_started, Qt.QueuedConnection)
+    controller.speech_ended.connect(ui.note_speech_ended, Qt.QueuedConnection)
+    controller.whisper_first_result.connect(ui.note_whisper_first_result, Qt.QueuedConnection)
     controller.thinking_started.connect(ui.note_thinking, Qt.QueuedConnection)
     controller.first_token.connect(ui.note_first_token, Qt.QueuedConnection)
     controller.first_sentence.connect(ui.note_first_sentence, Qt.QueuedConnection)

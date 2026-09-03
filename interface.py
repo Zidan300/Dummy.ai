@@ -1,4 +1,10 @@
-"""Premium, lightweight Qt interface for Dummy's local voice assistant."""
+"""Premium, lightweight Qt interface for Dummy's local voice assistant.
+
+Phase 10: makes the interface feel alive and intent-aware while keeping the
+paint loop lightweight (targets ~60 FPS on an M1, no expensive blur, no
+per-frame allocations beyond a few QPen/QColor objects, no worker-thread
+widget access).
+"""
 
 from __future__ import annotations
 
@@ -74,6 +80,7 @@ class DummyInterface(QWidget):
             event.ignore()
             self.close_requested.emit()
 
+    # -- Qt-thread-safe signal slots (GUI thread only) ----------------------
     def set_state(self, state: str) -> None:
         """Called through the queued controller.state_changed connection."""
         self.state = state.upper()
@@ -88,21 +95,34 @@ class DummyInterface(QWidget):
         """Set a subtle visual mood from deterministic controller metadata."""
         self._animator.set_category(category)
 
+    def set_intent(self, intent: str) -> None:
+        """Set the coarse intent mood (QUESTION/COMMAND/CONVERSATION/...)."""
+        self._animator.set_intent(intent)
+
     def note_activity(self, amount: float = 0.35) -> None:
         """Receive progress pulses through a queued Qt connection."""
         self._animator.note_activity(amount)
 
     def note_thinking(self) -> None:
-        self.note_activity(0.30)
+        self._animator.note_activity(0.30)
 
     def note_first_token(self) -> None:
-        self.note_activity(0.48)
+        self._animator.note_generation_milestone(0.50)
 
     def note_first_sentence(self) -> None:
-        self.note_activity(0.68)
+        self._animator.note_generation_milestone(0.70)
+
+    def note_whisper_first_result(self) -> None:
+        self._animator.note_activity(0.40)
+
+    def note_speech_started(self) -> None:
+        self._animator.note_speech_started()
+
+    def note_speech_ended(self) -> None:
+        self._animator.note_speech_ended()
 
     def note_interrupted(self) -> None:
-        self.note_activity(0.90)
+        self._animator.note_activity(0.90)
 
     def animate(self) -> None:
         now = time.monotonic()
@@ -131,6 +151,7 @@ class DummyInterface(QWidget):
             accent = self._accent()
 
             self._draw_background(painter, width, height, center, accent)
+            self._draw_voice_rings(painter, center, base_radius, accent)
             self._draw_particles(painter, center, base_radius, accent)
             self._draw_hud_arcs(painter, center, base_radius, accent)
             self._draw_core(painter, center, base_radius, accent)
@@ -166,6 +187,47 @@ class DummyInterface(QWidget):
         painter.setBrush(horizon)
         painter.drawRect(QRectF(0, 0, width, height))
 
+    def _draw_voice_rings(
+        self,
+        painter: QPainter,
+        center: QPointF,
+        base_radius: float,
+        accent: tuple[int, int, int],
+    ) -> None:
+        """State-specific expanding rings driven by real voice amplitude."""
+        ring = self._animator.listening_ring
+        speech = self._animator.speech_ring
+        painter.setBrush(Qt.NoBrush)
+        if ring > 0.02:
+            pen = QPen(self._with_alpha(accent, int(38 * ring)))
+            pen.setWidthF(1.0 + ring * 1.4)
+            painter.setPen(pen)
+            painter.drawEllipse(
+                center,
+                base_radius * (1.7 + ring * 0.9),
+                base_radius * (1.7 + ring * 0.9),
+            )
+        if speech > 0.02:
+            pen = QPen(self._with_alpha(accent, int(60 * speech)))
+            pen.setWidthF(1.2 + speech * 1.8)
+            painter.setPen(pen)
+            painter.drawEllipse(
+                center,
+                base_radius * (1.5 + speech * 1.1),
+                base_radius * (1.5 + speech * 1.1),
+            )
+        scan = self._animator.scan_ring
+        if scan > 0.02:
+            intensity = self._animator.state_intensity
+            pen = QPen(self._with_alpha(accent, int((40 + 30 * scan) * intensity)))
+            pen.setWidthF(0.8 + scan)
+            painter.setPen(pen)
+            painter.drawEllipse(
+                center,
+                base_radius * (1.3 + scan * 1.6),
+                base_radius * (1.3 + scan * 1.6),
+            )
+
     def _draw_particles(
         self,
         painter: QPainter,
@@ -174,31 +236,30 @@ class DummyInterface(QWidget):
         accent: tuple[int, int, int],
     ) -> None:
         energy = self._animator.spark_energy
+        intensity = self._animator.state_intensity
         painter.setPen(Qt.NoPen)
         for particle in self._particles:
-            angle = particle["angle"] + self._animator.time * particle["speed"] * (0.35 + energy)
+            angle = particle["angle"] + self._animator.time * particle["speed"] * (0.2 + energy * 0.6)
             radius = base_radius * (3.7 + particle["radius"] * 2.2)
             radius += math.sin(self._animator.time * 0.75 + particle["phase"]) * base_radius * 0.16
             x = center.x() + math.cos(angle) * radius
             y = center.y() + math.sin(angle) * radius * 0.57
             shimmer = 0.65 + 0.35 * math.sin(self._animator.time * 1.4 + particle["phase"])
-            alpha = int(255 * particle["alpha"] * shimmer * (0.28 + energy * 0.72))
+            alpha = int(255 * particle["alpha"] * shimmer * (0.22 + energy * 0.62) * (0.5 + intensity * 0.5))
             painter.setBrush(self._with_alpha(accent, alpha))
             size = particle["size"] * (0.75 + energy * 0.35)
             painter.drawEllipse(QPointF(x, y), size, size)
 
-        # A handful of brighter sparks give the core a sense of local activity
-        # without introducing a costly particle system or random per-frame work.
         for index in range(9):
             phase = index * 0.71 + 1.3
-            angle = phase + self._animator.time * (0.18 + index * 0.012)
+            angle = phase + self._animator.time * (0.16 + index * 0.012)
             radius = base_radius * (2.3 + (index % 3) * 0.36)
             radius += math.sin(self._animator.time * 1.6 + phase) * base_radius * 0.12
             point = QPointF(
                 center.x() + math.cos(angle) * radius,
                 center.y() + math.sin(angle) * radius * 0.62,
             )
-            alpha = int(150 * self._animator.spark_energy * (0.55 + 0.45 * math.sin(self._animator.time * 2.0 + phase)))
+            alpha = int(150 * self._animator.spark_energy * (0.5 + 0.45 * math.sin(self._animator.time * 2.0 + phase)))
             painter.setBrush(self._with_alpha(accent, max(0, alpha)))
             painter.drawEllipse(point, 1.0 + energy * 0.8, 1.0 + energy * 0.8)
 
@@ -217,8 +278,9 @@ class DummyInterface(QWidget):
         pen.setWidthF(1.0)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
+        sweep = 112 + self._animator.state_intensity * 26
         for radius, start, span in (
-            (base_radius * 2.02, 18, 112),
+            (base_radius * 2.02, 18, sweep),
             (base_radius * 2.18, 198, 62),
             (base_radius * 2.40, 284, 34),
         ):
@@ -276,14 +338,14 @@ class DummyInterface(QWidget):
         painter.setBrush(inner)
         painter.drawEllipse(center, radius, radius)
 
-        # Three slowly drifting energy currents give the orb depth without
-        # requiring a shader or a second animation thread.
-        for lane in range(3):
+        currents = 2 if self.state in {"IDLE", "STARTING"} else 3
+        flow = self._animator.flow
+        for lane in range(currents):
             path = QPainterPath()
             for index in range(34):
                 fraction = index / 33.0
                 x = center.x() - radius * 1.18 + fraction * radius * 2.36
-                y = center.y() + math.sin(fraction * 7.2 + self._animator.flow + lane * 2.0) * radius * (0.16 + lane * 0.035)
+                y = center.y() + math.sin(fraction * 7.2 + flow + lane * 2.0) * radius * (0.16 + lane * 0.035)
                 y += (lane - 1) * radius * 0.22
                 if index == 0:
                     path.moveTo(x, y)
@@ -378,13 +440,15 @@ class DummyInterface(QWidget):
             amplitude *= 0.40
         if self.state == "INTERRUPTED":
             amplitude *= max(0.18, self._animator.collapse)
+        voice = self._animator.voice_level * self._animator.audio_coupling
+        phase_speed = 2.2 + voice * 2.4
         path = QPainterPath()
         samples = 96
         for index in range(samples):
             fraction = index / (samples - 1)
             x = center.x() - width * 0.5 + fraction * width
             envelope = math.sin(math.pi * fraction) ** 0.72
-            carrier = math.sin(fraction * 18.0 - self._animator.flow * 2.2)
+            carrier = math.sin(fraction * 18.0 - self._animator.flow * phase_speed)
             y = baseline + carrier * amplitude * envelope
             if index == 0:
                 path.moveTo(x, y)

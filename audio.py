@@ -214,6 +214,16 @@ class AudioCapture:
         """Discard audio captured during processing or speaker playback."""
         self._clear_frames()
 
+    def clear_consumer(self, name: str) -> None:
+        """Discard only one logical consumer's buffered audio."""
+        with self._lock:
+            frame_queue = self._frame_queues.get(name)
+            event_queue = self._event_queues.get(name)
+        if frame_queue is not None:
+            self._clear_queue(frame_queue)
+        if event_queue is not None:
+            self._clear_queue(event_queue)
+
     def _report_event(self, kind: str, message: str) -> None:
         with self._lock:
             event_queues = list(self._event_queues.values())
@@ -315,6 +325,7 @@ class UtteranceDetector:
         ignore_until: float = 0.0,
         max_utterance_seconds: float = MAX_UTTERANCE_SECONDS,
         consumer: str = "default",
+        on_utterance_info=None,
     ) -> np.ndarray | None:
         prebuffer: deque[np.ndarray] = deque(maxlen=PREBUFFER_FRAMES)
         utterance: list[np.ndarray] = []
@@ -322,6 +333,21 @@ class UtteranceDetector:
         silence_run = 0
         speaking = False
         started_at = 0.0
+        speech_frame_count = 0
+        prebuffer_frame_count = 0
+
+        def finish(frames: list[np.ndarray]) -> np.ndarray:
+            audio = self._to_float_audio(frames)
+            if on_utterance_info:
+                on_utterance_info(
+                    {
+                        "audio_seconds": len(audio) / SAMPLE_RATE,
+                        "rms": float(math.sqrt(float(np.mean(audio * audio)))) if audio.size else 0.0,
+                        "vad_speech_seconds": speech_frame_count * FRAME_MS / 1000.0,
+                        "prebuffer_frames": prebuffer_frame_count,
+                    }
+                )
+            return audio
 
         while not stop_event.is_set():
             if time.monotonic() < ignore_until:
@@ -358,6 +384,8 @@ class UtteranceDetector:
                         speaking = True
                         started_at = time.monotonic()
                         utterance = list(prebuffer)
+                        prebuffer_frame_count = len(prebuffer)
+                        speech_frame_count = 0
                         if on_speech_detected:
                             on_speech_detected()
                 else:
@@ -366,16 +394,17 @@ class UtteranceDetector:
 
             utterance.append(frame)
             if is_speech:
+                speech_frame_count += 1
                 silence_run = 0
             else:
                 silence_run += 1
 
             if silence_run >= SILENCE_FRAMES:
-                return self._to_float_audio(utterance)
+                return finish(utterance)
 
             if time.monotonic() - started_at >= max_utterance_seconds:
                 logger.info("Maximum utterance duration reached")
-                return self._to_float_audio(utterance)
+                return finish(utterance)
 
         return None
 
