@@ -49,7 +49,7 @@ class TranscriptionError(RuntimeError):
 class AudioCapture:
     """Keep one callback-based PortAudio stream open for the app lifetime."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_level=None) -> None:
         self._frames: queue.Queue[np.ndarray] = queue.Queue(maxsize=160)
         self._events: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=16)
         self._stream: sd.InputStream | None = None
@@ -57,6 +57,7 @@ class AudioCapture:
         self._accepting = False
         self._last_overflow_report = 0.0
         self._last_frame_at = 0.0
+        self._on_level = on_level
 
     def start(self) -> None:
         with self._lock:
@@ -192,6 +193,16 @@ class AudioCapture:
                 self._report_event("stream", f"unexpected audio frame size: {len(frame)}")
                 return
             self._last_frame_at = time.monotonic()
+            if self._on_level is not None:
+                try:
+                    # A normalized RMS estimate is cheap enough for the existing
+                    # PortAudio callback. The Qt signal receiver performs all UI
+                    # work on the GUI thread.
+                    normalized = frame.astype(np.float32) / 32768.0
+                    level = float(min(1.0, math.sqrt(float(np.mean(normalized * normalized))) * 4.0))
+                    self._on_level(level)
+                except Exception as exc:
+                    self._report_event("stream", f"audio level callback failed: {exc}")
             try:
                 self._frames.put_nowait(frame)
             except queue.Full:

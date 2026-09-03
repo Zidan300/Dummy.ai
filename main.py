@@ -126,21 +126,34 @@ class ResponsePipeline:
         self._generation_thread.start()
 
     def wait(self) -> None:
-        """Wait until both worker threads have stopped."""
-        self._generation_thread.join()
+        """Wait normally, but return promptly once a turn is cancelled.
+
+        Ollama's HTTP iterator may not unblock immediately after cancellation.
+        TTS is stopped synchronously, while the cancelled generation worker
+        observes the event and is prevented from publishing further output.
+        """
         self._tts_thread.join()
+        if self.is_cancelled():
+            self._generation_thread.join(timeout=0.15)
+            self._clear_pending_sentences()
+            self.done.set()
+            return
+
+        self._generation_thread.join()
         # join() is the authoritative completion check. The events make the
         # lifecycle observable in tests and prevent a consumer-only event from
         # being mistaken for full pipeline completion.
         self.generation_finished.wait()
         self.tts_finished.wait()
-        if not self.is_cancelled():
-            self.sentences.join()
+        self.sentences.join()
         self.done.set()
 
     def cancel(self) -> int:
         """Cancel this response without shutting down the application."""
         self._cancel_event.set()
+        return self._clear_pending_sentences()
+
+    def _clear_pending_sentences(self) -> int:
         cleared = 0
         while True:
             try:
@@ -266,6 +279,9 @@ class ResponsePipeline:
                     self.tts_error = exc
                     if not self.is_cancelled():
                         self.on_error(exc)
+                        # Do not allow later queued sentences to play after
+                        # the player has reported a real failure.
+                        self.cancel()
                 finally:
                     self.sentences.task_done()
         except Exception as exc:
@@ -395,6 +411,7 @@ class VoiceController(QObject):
     """The Qt worker owning the continuous voice loop."""
 
     state_changed = Signal(str)
+    audio_level = Signal(float)
     error = Signal(str)
     finished = Signal()
 
@@ -404,7 +421,7 @@ class VoiceController(QObject):
         self._state_lock = threading.Lock()
         self._state = "STARTING"
         self.context = ConversationContext(max_turns=10)
-        self.audio = AudioCapture()
+        self.audio = AudioCapture(on_level=self.audio_level.emit)
         self.transcriber = WhisperTranscriber()
         self.detector: UtteranceDetector | None = None
         self.player = SpeechPlayer()
@@ -802,6 +819,7 @@ def main() -> int:
 
     previous_qt_handler = qInstallMessageHandler(handle_qt_message)
     controller.state_changed.connect(ui.set_state, Qt.QueuedConnection)
+    controller.audio_level.connect(ui.set_audio_level, Qt.QueuedConnection)
     thread.started.connect(controller.run, Qt.QueuedConnection)
     controller.finished.connect(thread.quit, Qt.DirectConnection)
     controller.finished.connect(controller.deleteLater)

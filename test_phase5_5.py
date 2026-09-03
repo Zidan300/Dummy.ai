@@ -52,6 +52,7 @@ class IntentTests(unittest.TestCase):
         self.assertEqual(classify_intent("stop"), "INTERRUPTION")
         self.assertEqual(classify_intent("cancel that"), "INTERRUPTION")
         self.assertEqual(classify_intent("goodbye"), "EXIT")
+        self.assertEqual(classify_intent("turn off"), "EXIT")
 
     def test_command_like_words_inside_questions_are_safe(self):
         self.assertEqual(classify_intent("How do I stop a running server?"), "QUESTION")
@@ -62,11 +63,14 @@ class IntentTests(unittest.TestCase):
 
 class ResponseQualityTests(unittest.TestCase):
     def test_prompt_contains_voice_quality_and_factuality_rules(self):
-        self.assertIn("most useful information first", ai.SYSTEM_PROMPT)
-        self.assertIn("Never invent facts", ai.SYSTEM_PROMPT)
-        self.assertIn("what did I just", ai.SYSTEM_PROMPT)
+        self.assertIn("important facts", ai.SYSTEM_PROMPT)
+        self.assertIn("Never fabricate facts", ai.SYSTEM_PROMPT)
+        self.assertIn("Memory questions", ai.SYSTEM_PROMPT)
         self.assertIn("step-by-step", ai.SYSTEM_PROMPT)
         self.assertIn("primary request", ai.SYSTEM_PROMPT)
+        self.assertIn("Answer first", ai.SYSTEM_PROMPT)
+        self.assertIn("mild sarcasm", ai.SYSTEM_PROMPT)
+        self.assertIn("clever friend", ai.SYSTEM_PROMPT)
 
     def test_reliable_references_can_be_answered_locally(self):
         context = ConversationContext()
@@ -115,10 +119,10 @@ class ResponseQualityTests(unittest.TestCase):
         self.assertEqual(result, "Docker is useful. It keeps deployments consistent.")
         self.assertEqual(tokens, ["Docker is useful. ", "It keeps deployments consistent."])
         self.assertTrue(call["stream"])
-        self.assertEqual(call["options"]["temperature"], 0.18)
-        self.assertEqual(call["options"]["top_p"], 0.8)
-        self.assertEqual(call["options"]["top_k"], 20)
-        self.assertEqual(call["options"]["num_predict"], 128)
+        self.assertEqual(call["options"]["temperature"], 0.22)
+        self.assertEqual(call["options"]["top_p"], 0.82)
+        self.assertEqual(call["options"]["top_k"], 22)
+        self.assertEqual(call["options"]["num_predict"], 88)
         self.assertTrue(stream.closed)
 
     def test_empty_stream_is_honest_and_closes(self):

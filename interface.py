@@ -91,17 +91,7 @@ class DummyInterface(QWidget):
         self.update()
 
     def _accent(self) -> tuple[int, int, int]:
-        if self.state == "LISTENING":
-            return (109, 224, 216)
-        if self.state in {"THINKING", "PROCESSING"}:
-            return (164, 142, 255)
-        if self.state == "SPEAKING":
-            return (255, 193, 139)
-        if self.state == "ERROR":
-            return (255, 116, 132)
-        if self.state == "INTERRUPTED":
-            return (255, 194, 124)
-        return (129, 163, 239)
+        return self._animator.accent
 
     @staticmethod
     def _with_alpha(color: tuple[int, int, int], alpha: int) -> QColor:
@@ -163,7 +153,7 @@ class DummyInterface(QWidget):
         base_radius: float,
         accent: tuple[int, int, int],
     ) -> None:
-        energy = self._animator.energy
+        energy = self._animator.spark_energy
         painter.setPen(Qt.NoPen)
         for particle in self._particles:
             angle = particle["angle"] + self._animator.time * particle["speed"] * (0.35 + energy)
@@ -172,10 +162,25 @@ class DummyInterface(QWidget):
             x = center.x() + math.cos(angle) * radius
             y = center.y() + math.sin(angle) * radius * 0.57
             shimmer = 0.65 + 0.35 * math.sin(self._animator.time * 1.4 + particle["phase"])
-            alpha = int(255 * particle["alpha"] * shimmer * (0.45 + energy * 0.55))
+            alpha = int(255 * particle["alpha"] * shimmer * (0.28 + energy * 0.72))
             painter.setBrush(self._with_alpha(accent, alpha))
             size = particle["size"] * (0.75 + energy * 0.35)
             painter.drawEllipse(QPointF(x, y), size, size)
+
+        # A handful of brighter sparks give the core a sense of local activity
+        # without introducing a costly particle system or random per-frame work.
+        for index in range(9):
+            phase = index * 0.71 + 1.3
+            angle = phase + self._animator.time * (0.18 + index * 0.012)
+            radius = base_radius * (2.3 + (index % 3) * 0.36)
+            radius += math.sin(self._animator.time * 1.6 + phase) * base_radius * 0.12
+            point = QPointF(
+                center.x() + math.cos(angle) * radius,
+                center.y() + math.sin(angle) * radius * 0.62,
+            )
+            alpha = int(150 * self._animator.spark_energy * (0.55 + 0.45 * math.sin(self._animator.time * 2.0 + phase)))
+            painter.setBrush(self._with_alpha(accent, max(0, alpha)))
+            painter.drawEllipse(point, 1.0 + energy * 0.8, 1.0 + energy * 0.8)
 
     def _draw_hud_arcs(
         self,
@@ -271,6 +276,8 @@ class DummyInterface(QWidget):
             painter.drawPath(path)
         painter.restore()
 
+        self._draw_energy_orbits(painter, center, radius, accent)
+
         edge = QPen(self._with_alpha(accent, int(98 + self._animator.energy * 62)))
         edge.setWidthF(1.1)
         painter.setPen(edge)
@@ -291,6 +298,45 @@ class DummyInterface(QWidget):
             radius * 0.30,
             radius * 0.24,
         )
+
+        nucleus = radius * (0.12 + self._animator.energy * 0.025)
+        nucleus_gradient = QRadialGradient(center, nucleus * 1.8)
+        nucleus_gradient.setColorAt(0.0, QColor(255, 255, 255, 235))
+        nucleus_gradient.setColorAt(0.34, self._with_alpha(accent, 180))
+        nucleus_gradient.setColorAt(1.0, self._with_alpha(accent, 0))
+        painter.setBrush(nucleus_gradient)
+        painter.drawEllipse(center, nucleus * 1.8, nucleus * 1.8)
+        painter.setBrush(QColor(255, 255, 255, 225))
+        painter.drawEllipse(center, nucleus * 0.32, nucleus * 0.32)
+
+    def _draw_energy_orbits(
+        self,
+        painter: QPainter,
+        center: QPointF,
+        radius: float,
+        accent: tuple[int, int, int],
+    ) -> None:
+        energy = self._animator.orbit_energy
+        painter.save()
+        painter.translate(center)
+        painter.rotate(self._animator.rotation * 0.62)
+        painter.setBrush(Qt.NoBrush)
+        for index, (x_radius, y_radius, start, span) in enumerate(
+            (
+                (radius * 1.28, radius * 0.48, 206, 96),
+                (radius * 1.42, radius * 0.60, 28, 72),
+                (radius * 1.16, radius * 0.74, 132, 54),
+            )
+        ):
+            pen = QPen(self._with_alpha(accent, int((24 + energy * 52) / (index + 1))))
+            pen.setWidthF(0.8 + energy * 0.45)
+            painter.setPen(pen)
+            painter.drawArc(
+                QRectF(-x_radius, -y_radius, x_radius * 2, y_radius * 2),
+                int(start * 16),
+                int(span * 16),
+            )
+        painter.restore()
 
     @staticmethod
     def _ellipse_path(center: QPointF, radius: float) -> QPainterPath:

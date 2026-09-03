@@ -16,6 +16,7 @@ EXIT_COMMANDS = frozenset(
         "shut down",
         "goodbye",
         "good bye",
+        "turn off",
         "terminate",
     }
 )
