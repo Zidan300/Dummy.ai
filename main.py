@@ -34,6 +34,7 @@ from context import (
     EXIT_COMMANDS,
     INTERRUPTION_COMMANDS,
     classify_intent,
+    classify_question_category,
     is_exit_command,
     normalize_spoken_text,
 )
@@ -66,6 +67,43 @@ class CombinedCancellation:
         return any(event.is_set() for event in self._events)
 
 
+class PerformanceTimeline:
+    """Monotonic, per-utterance timing marks for the voice pipeline."""
+
+    def __init__(self, clock=time.perf_counter) -> None:
+        self._clock = clock
+        self.started_at: float | None = None
+        self.marks: dict[str, float] = {}
+
+    def mark(self, name: str) -> float:
+        timestamp = self._clock()
+        if self.started_at is None:
+            self.started_at = timestamp
+        self.marks[name] = timestamp
+        logger.info("[PERF] %s: %.0f ms", name, (timestamp - self.started_at) * 1000.0)
+        return timestamp
+
+    def elapsed(self, start: str, end: str) -> float | None:
+        first = self.marks.get(start)
+        last = self.marks.get(end)
+        if first is None or last is None:
+            return None
+        return max(0.0, last - first)
+
+    def report(self) -> None:
+        token_start = "gemma_started" if "gemma_started" in self.marks else "whisper_finished"
+        pairs = (
+            ("time_to_understand", "speech_finished", "whisper_finished"),
+            ("time_to_first_token", token_start, "first_token"),
+            ("time_to_first_sentence", "first_token", "first_sentence"),
+            ("time_to_first_audio", "speech_finished", "playback_started"),
+        )
+        for label, start, end in pairs:
+            duration = self.elapsed(start, end)
+            if duration is not None:
+                logger.info("[PERF] %s: %.0f ms", label, duration * 1000.0)
+
+
 class ResponsePipeline:
     """Generate streamed text and synthesize sentences concurrently."""
 
@@ -83,6 +121,10 @@ class ResponsePipeline:
         on_tts_finished=None,
         history=None,
         response_override: str | None = None,
+        on_generation_started=None,
+        on_piper_started=None,
+        on_audio_ready=None,
+        on_audio_level=None,
     ) -> None:
         self.prompt = prompt
         self.stop_event = stop_event
@@ -96,6 +138,10 @@ class ResponsePipeline:
         self.on_tts_finished = on_tts_finished
         self.history = list(history or ())
         self.response_override = response_override
+        self.on_generation_started = on_generation_started
+        self.on_piper_started = on_piper_started
+        self.on_audio_ready = on_audio_ready
+        self.on_audio_level = on_audio_level
         self.sentences: queue.Queue[str | None] = queue.Queue(maxsize=self.QUEUE_SIZE)
         self.done = threading.Event()
         self.response = ""
@@ -173,6 +219,8 @@ class ResponsePipeline:
             logger.info("Gemma generation started")
         else:
             logger.info("Local command response prepared")
+        if self.response_override is None and self.on_generation_started:
+            self.on_generation_started()
 
         def receive_token(token: str) -> None:
             if self.is_cancelled():
@@ -270,7 +318,10 @@ class ResponsePipeline:
                     played = self.player.speak(
                         sentence,
                         self._cancel_token,
+                        on_piper_start=self._piper_started,
+                        on_audio_ready=self._audio_ready,
                         on_playback_start=self._playback_started,
+                        on_playback_level=self._playback_level,
                     )
                     if not played and not self.is_cancelled():
                         raise TTSError("TTS returned without playing the sentence")
@@ -301,11 +352,117 @@ class ResponsePipeline:
         logger.info("TTS started")
         self.on_playback_start()
 
+    def _piper_started(self) -> None:
+        if not self.is_cancelled() and self.on_piper_started:
+            self.on_piper_started()
+
+    def _audio_ready(self) -> None:
+        if not self.is_cancelled() and self.on_audio_ready:
+            self.on_audio_ready()
+
+    def _playback_level(self, level: float) -> None:
+        if not self.is_cancelled() and self.on_audio_level:
+            self.on_audio_level(level)
+
+
+class NormalSpeechMonitor:
+    """Continuously detect normal utterances from a broadcast mic queue."""
+
+    CONSUMER = "normal"
+
+    def __init__(self, capture, detector, app_stop_event, on_utterance, on_error, on_speech_started, on_speech_ended):
+        self.capture = capture
+        self.detector = detector
+        self.app_stop_event = app_stop_event
+        self.on_utterance = on_utterance
+        self.on_error = on_error
+        self.on_speech_started = on_speech_started
+        self.on_speech_ended = on_speech_ended
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._stop_event: threading.Event | None = None
+        self._reset_event = threading.Event()
+        register = getattr(self.capture, "register_consumer", None)
+        if register is not None:
+            register(self.CONSUMER)
+
+    def start(self) -> None:
+        self.stop()
+        self.capture.clear_pending_frames()
+        local_stop = threading.Event()
+        with self._lock:
+            self._stop_event = local_stop
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(local_stop,),
+                name="dummy-normal-listener",
+                daemon=False,
+            )
+            thread = self._thread
+        thread.start()
+
+    def reset(self) -> None:
+        self._reset_event.set()
+
+    def stop(self) -> None:
+        with self._lock:
+            stop_event = self._stop_event
+            thread = self._thread
+        if stop_event is not None:
+            stop_event.set()
+        self._reset_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
+                self._stop_event = None
+
+    def is_alive(self) -> bool:
+        with self._lock:
+            return bool(self._thread and self._thread.is_alive())
+
+    def _run(self, local_stop: threading.Event) -> None:
+        try:
+            while not self.app_stop_event.is_set() and not local_stop.is_set():
+                self._reset_event.clear()
+                cancel = CombinedCancellation(self.app_stop_event, local_stop, self._reset_event)
+                timeline = PerformanceTimeline()
+
+                def speech_started() -> None:
+                    logger.info("Speech detected")
+                    timeline.mark("speech_detected")
+                    self.on_speech_started(timeline)
+
+                try:
+                    utterance = self.detector.listen(
+                        self.capture,
+                        cancel,
+                        on_speech_detected=speech_started,
+                        consumer=self.CONSUMER,
+                    )
+                except (AudioError, VadError) as exc:
+                    if cancel.is_set():
+                        continue
+                    self.on_error(exc)
+                    return
+
+                if cancel.is_set():
+                    continue
+                if utterance is not None:
+                    timeline.mark("speech_finished")
+                    self.on_speech_ended(timeline)
+                    self.on_utterance(utterance, timeline)
+        except Exception as exc:
+            if not self.app_stop_event.is_set() and not local_stop.is_set():
+                self.on_error(exc)
+
 
 class BargeInMonitor:
     """Recognize explicit control phrases on a short rolling VAD path."""
 
     SPEAKER_START_GUARD_SECONDS = 0.45
+    CONSUMER = "barge"
 
     def __init__(self, capture, transcriber, app_stop_event, on_command) -> None:
         self.capture = capture
@@ -317,6 +474,9 @@ class BargeInMonitor:
         self._stop_event: threading.Event | None = None
         self._session_id: int | None = None
         self._guard_until = 0.0
+        register = getattr(self.capture, "register_consumer", None)
+        if register is not None:
+            register(self.CONSUMER)
 
     def start(self, session_id: int) -> None:
         self.stop()
@@ -380,6 +540,7 @@ class BargeInMonitor:
                             pause_confirmed=pause_confirmed,
                         ),
                         ignore_until=lambda: self._guard_until_for(session_id),
+                        consumer=self.CONSUMER,
                     )
                 except (AudioError, VadError) as exc:
                     if not cancel.is_set():
@@ -427,6 +588,17 @@ class VoiceController(QObject):
 
     state_changed = Signal(str)
     audio_level = Signal(float)
+    question_category = Signal(str)
+    speech_started = Signal()
+    speech_ended = Signal()
+    thinking_started = Signal()
+    whisper_first_result = Signal()
+    first_token = Signal()
+    first_sentence = Signal()
+    tts_started = Signal()
+    tts_finished = Signal()
+    response_finished = Signal()
+    interrupted = Signal()
     error = Signal(str)
     finished = Signal()
 
@@ -442,6 +614,8 @@ class VoiceController(QObject):
         self.player = SpeechPlayer()
         self._pipeline: ResponsePipeline | None = None
         self._pipeline_lock = threading.RLock()
+        self._processing = False
+        self._utterances: queue.Queue[tuple[object, PerformanceTimeline]] = queue.Queue(maxsize=2)
         self._next_session_id = 0
         self._active_session_id: int | None = None
         self._interrupted_session_id: int | None = None
@@ -452,6 +626,7 @@ class VoiceController(QObject):
             self._stop_event,
             self._handle_barge_in,
         )
+        self._normal_monitor: NormalSpeechMonitor | None = None
 
     @property
     def stop_event(self) -> threading.Event:
@@ -491,6 +666,9 @@ class VoiceController(QObject):
             logger.info("%sffplay terminated", "[BARGE] " if barge else "")
         self.audio.clear_pending_frames()
         if barge:
+            if self._normal_monitor is not None:
+                self._normal_monitor.reset()
+            self._clear_queued_utterances()
             logger.info("[BARGE] microphone buffer cleared")
         if detected_at is not None:
             logger.info(
@@ -509,10 +687,24 @@ class VoiceController(QObject):
             if not self._initialize():
                 return
 
+            if self._normal_monitor is None:
+                raise VadError("normal speech monitor is not initialized")
+            self._normal_monitor.start()
             self._set_state("IDLE")
             self._set_state("LISTENING")
             while not self._stop_event.is_set():
-                self._listen_and_process()
+                if not self._normal_monitor.is_alive():
+                    if not self._recover_microphone():
+                        break
+                    self._normal_monitor.start()
+                try:
+                    utterance, timeline = self._utterances.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    self._process_utterance(utterance, timeline)
+                finally:
+                    self._utterances.task_done()
         except Exception as exc:
             logger.exception("Voice worker failed")
             self.error.emit(str(exc))
@@ -521,7 +713,14 @@ class VoiceController(QObject):
             self.context.clear()
             self._set_state("SHUTTING_DOWN")
             self.interrupt_tts()
+            if self._normal_monitor is not None:
+                self._normal_monitor.stop()
             self._barge_monitor.stop()
+            with self._pipeline_lock:
+                active_pipeline = self._pipeline
+            if active_pipeline is not None:
+                active_pipeline.cancel()
+                active_pipeline.wait()
             self.audio.stop()
             self.player.cancel()
             self._set_state("STOPPED")
@@ -531,10 +730,25 @@ class VoiceController(QObject):
         while not self._stop_event.is_set():
             try:
                 if not self.audio.is_active():
+                    microphone_started_at = time.perf_counter()
                     self.audio.start()
                     logger.info("Microphone ready")
+                    logger.info(
+                        "[PERF] microphone_startup: %.0f ms",
+                        (time.perf_counter() - microphone_started_at) * 1000.0,
+                    )
                 if self.detector is None:
                     self.detector = UtteranceDetector()
+                if self._normal_monitor is None:
+                    self._normal_monitor = NormalSpeechMonitor(
+                        self.audio,
+                        self.detector,
+                        self._stop_event,
+                        self._queue_normal_utterance,
+                        self._normal_monitor_error,
+                        self._normal_speech_started,
+                        self._normal_speech_ended,
+                    )
                 if not self.transcriber.ready:
                     self.transcriber.load()
                 return True
@@ -545,48 +759,91 @@ class VoiceController(QObject):
                     return False
         return False
 
-    def _listen_and_process(self) -> None:
-        if not self.audio.is_active():
-            if not self._recover_microphone():
-                return
+    def _normal_speech_started(self, timeline: PerformanceTimeline) -> None:
+        del timeline
+        self.speech_started.emit()
 
-        self._set_state("LISTENING")
-        try:
-            if self.detector is None:
-                raise VadError("VAD is not initialized")
-            utterance = self.detector.listen(
-                self.audio,
-                self._stop_event,
-                on_speech_detected=lambda: logger.info("Speech detected"),
+    def _normal_speech_ended(self, timeline: PerformanceTimeline) -> None:
+        del timeline
+        self.speech_ended.emit()
+
+    def _normal_monitor_error(self, exc: Exception) -> None:
+        if self._stop_event.is_set():
+            return
+        logger.error("Normal speech monitor failed: %s", exc)
+        self._report_recoverable_error(exc)
+
+    def _queue_normal_utterance(self, utterance, timeline: PerformanceTimeline) -> None:
+        with self._pipeline_lock:
+            accepting = (
+                not self._stop_event.is_set()
+                and self._pipeline is None
+                and self._active_session_id is None
+                and not self._processing
             )
-        except (AudioError, VadError) as exc:
-            if self._stop_event.is_set():
-                return
-            self._report_recoverable_error(exc)
-            self.audio.stop()
-            self._wait_or_stop(0.5)
+        if not accepting:
+            logger.debug("Discarding speech while a response is active")
             return
-
-        if utterance is None or self._stop_event.is_set():
-            return
-
-        speech_end_at = time.perf_counter()
-        self._set_state("PROCESSING")
         try:
-            text = self.transcriber.transcribe(utterance, self._stop_event)
+            self._utterances.put_nowait((utterance, timeline))
+        except queue.Full:
+            logger.warning("Normal utterance queue full; discarding oldest input")
+            try:
+                self._utterances.get_nowait()
+                self._utterances.task_done()
+            except queue.Empty:
+                pass
+            try:
+                self._utterances.put_nowait((utterance, timeline))
+            except queue.Full:
+                pass
+
+    def _clear_queued_utterances(self) -> None:
+        while True:
+            try:
+                self._utterances.get_nowait()
+                self._utterances.task_done()
+            except queue.Empty:
+                return
+
+    def _processing_done(self) -> None:
+        with self._pipeline_lock:
+            self._processing = False
+
+    def _process_utterance(self, utterance, timeline: PerformanceTimeline) -> None:
+        with self._pipeline_lock:
+            if self._processing or self._pipeline is not None or self._stop_event.is_set():
+                return
+            self._processing = True
+
+        self._set_state("PROCESSING")
+
+        def whisper_first_result() -> None:
+            timeline.mark("whisper_first_result")
+            self.whisper_first_result.emit()
+
+        timeline.mark("whisper_started")
+        try:
+            text = self.transcriber.transcribe(
+                utterance,
+                self._stop_event,
+                on_first_result=whisper_first_result,
+            )
         except TranscriptionError as exc:
             self._report_recoverable_error(exc)
             self._wait_or_stop(0.75)
+            self._processing_done()
             return
 
-        transcription_complete_at = time.perf_counter()
+        timeline.mark("whisper_finished")
         logger.info("Transcription complete")
-        logger.info("[PERF] Transcription: %.2fs", transcription_complete_at - speech_end_at)
         if self._stop_event.is_set():
+            self._processing_done()
             return
         if not text:
             logger.warning("Empty transcription; returning to LISTENING")
             self._set_state("LISTENING")
+            self._processing_done()
             return
         logger.info("User: %s", text)
 
@@ -594,10 +851,12 @@ class VoiceController(QObject):
         if intent == "EXIT":
             logger.info("Voice exit command detected")
             self.request_shutdown("voice exit command")
+            self._processing_done()
             return
         if intent == "INTERRUPTION":
             logger.info("Interruption command ignored while listening")
             self._set_state("LISTENING")
+            self._processing_done()
             return
 
         history = self.context.snapshot()
@@ -605,38 +864,29 @@ class VoiceController(QObject):
         if response_override is None and intent == "COMMAND":
             response_override = unsupported_command_response(text)
 
+        self.question_category.emit(classify_question_category(text))
         self._set_state("THINKING")
+        self.thinking_started.emit()
         with self._pipeline_lock:
             self._next_session_id += 1
             session_id = self._next_session_id
             self._interrupted_session_id = None
             self._interruption_started_at = None
 
-        first_token_at: float | None = None
-        first_sentence_at: float | None = None
-        first_audio_at: float | None = None
-
         def first_token() -> None:
-            nonlocal first_token_at
-            if first_token_at is None:
-                first_token_at = time.perf_counter()
-                logger.info(
-                    "[PERF] First token: %.2fs",
-                    first_token_at - transcription_complete_at,
-                )
+            if "first_token" not in timeline.marks:
+                timeline.mark("first_token")
+                self.first_token.emit()
 
         def first_sentence() -> None:
-            nonlocal first_sentence_at
-            if first_sentence_at is None:
-                first_sentence_at = time.perf_counter()
-                if first_token_at is not None:
-                    logger.info(
-                        "[PERF] First sentence: %.2fs",
-                        first_sentence_at - first_token_at,
-                    )
+            if "first_sentence" not in timeline.marks:
+                timeline.mark("first_sentence")
+                self.first_sentence.emit()
+
+        def gemma_started() -> None:
+            timeline.mark("gemma_started")
 
         def playback_start() -> None:
-            nonlocal first_audio_at
             with self._pipeline_lock:
                 pipeline = self._pipeline
                 if (
@@ -647,24 +897,46 @@ class VoiceController(QObject):
                     or self._interrupted_session_id == session_id
                 ):
                     return
-                if first_audio_at is None:
-                    first_audio_at = time.perf_counter()
+                if "playback_started" not in timeline.marks:
+                    timeline.mark("playback_started")
                     self._barge_monitor.set_playback_guard(session_id)
                     self._set_state("SPEAKING")
-                    if first_sentence_at is not None:
-                        logger.info(
-                            "[PERF] TTS start: %.2fs",
-                            first_audio_at - first_sentence_at,
-                        )
+                    self.tts_started.emit()
+
+        def piper_started() -> None:
+            timeline.mark("piper_started")
+
+        def audio_ready() -> None:
+            timeline.mark("audio_ready")
+
+        def playback_level(level: float) -> None:
+            with self._pipeline_lock:
+                if (
+                    self._active_session_id == session_id
+                    and self._interrupted_session_id != session_id
+                    and not self._stop_event.is_set()
+                ):
+                    self.audio_level.emit(level)
 
         def tts_finished() -> None:
-            self._barge_monitor.request_stop(session_id)
+            with self._pipeline_lock:
+                current = self._pipeline is pipeline and self._active_session_id == session_id
+            if current:
+                self._barge_monitor.request_stop(session_id)
+                self.tts_finished.emit()
+
+        def pipeline_error(exc: Exception) -> None:
+            with self._pipeline_lock:
+                current = self._pipeline is pipeline and self._active_session_id == session_id
+            if current:
+                self._report_recoverable_error(exc)
 
         try:
             self.player.reset_cancellation()
         except TTSError as exc:
             self._report_recoverable_error(exc)
             self._wait_or_stop(0.25)
+            self._processing_done()
             return
 
         pipeline = ResponsePipeline(
@@ -674,10 +946,14 @@ class VoiceController(QObject):
             first_token,
             first_sentence,
             playback_start,
-            self._report_recoverable_error,
+            pipeline_error,
             on_tts_finished=tts_finished,
             history=history,
             response_override=response_override,
+            on_generation_started=gemma_started,
+            on_piper_started=piper_started,
+            on_audio_ready=audio_ready,
+            on_audio_level=playback_level,
         )
         with self._pipeline_lock:
             self._pipeline = pipeline
@@ -685,55 +961,79 @@ class VoiceController(QObject):
         try:
             self._barge_monitor.start(session_id)
             pipeline.start()
-            pipeline.wait()
-            with self._pipeline_lock:
-                interrupted = self._interrupted_session_id == session_id
-            if not self._stop_event.is_set() and not interrupted:
-                if pipeline.generation_error is not None:
-                    self._wait_or_stop(0.75)
-                elif not pipeline.response.strip():
-                    logger.error("Gemma returned empty response")
-                    self._set_state("ERROR")
-                    self._wait_or_stop(0.75)
-                elif (
-                    not pipeline.generation_finished.is_set()
-                    or not pipeline.tts_finished.is_set()
-                    or not pipeline.generation_succeeded
-                    or not pipeline.tts_succeeded
-                    or not pipeline.sentences.empty()
-                    or pipeline.sentences.unfinished_tasks != 0
-                ):
-                    logger.error(
-                        "Response pipeline incomplete: generation_finished=%s "
-                        "tts_finished=%s generation_ok=%s tts_ok=%s queue_empty=%s",
-                        pipeline.generation_finished.is_set(),
-                        pipeline.tts_finished.is_set(),
-                        pipeline.generation_succeeded,
-                        pipeline.tts_succeeded,
-                        pipeline.sentences.empty(),
-                    )
-                    self._set_state("ERROR")
-                    self._wait_or_stop(0.75)
-                else:
-                    self.context.append(text, pipeline.response)
-                    logger.info(
-                        "[PERF] Total response: %.2fs",
-                        time.perf_counter() - transcription_complete_at,
-                    )
-        finally:
-            self._barge_monitor.stop(session_id)
+            self._processing_done()
+        except Exception:
+            self._processing_done()
+            raise
+        threading.Thread(
+            target=self._finish_pipeline,
+            args=(session_id, pipeline, timeline, text),
+            name=f"dummy-response-finish-{session_id}",
+            daemon=False,
+        ).start()
+
+    def _finish_pipeline(
+        self,
+        session_id: int,
+        pipeline: ResponsePipeline,
+        timeline: PerformanceTimeline,
+        text: str,
+    ) -> None:
+        pipeline.wait()
+        with self._pipeline_lock:
+            owns_session = self._pipeline is pipeline and self._active_session_id == session_id
+            interrupted = self._interrupted_session_id == session_id
+        if owns_session and not self._stop_event.is_set() and not interrupted:
+            if pipeline.generation_error is not None:
+                self._wait_or_stop(0.75)
+            elif not pipeline.response.strip():
+                logger.error("Gemma returned empty response")
+                self._set_state("ERROR")
+                self._wait_or_stop(0.75)
+            elif (
+                not pipeline.generation_finished.is_set()
+                or not pipeline.tts_finished.is_set()
+                or not pipeline.generation_succeeded
+                or not pipeline.tts_succeeded
+                or not pipeline.sentences.empty()
+                or pipeline.sentences.unfinished_tasks != 0
+            ):
+                logger.error(
+                    "Response pipeline incomplete: generation_finished=%s "
+                    "tts_finished=%s generation_ok=%s tts_ok=%s queue_empty=%s",
+                    pipeline.generation_finished.is_set(),
+                    pipeline.tts_finished.is_set(),
+                    pipeline.generation_succeeded,
+                    pipeline.tts_succeeded,
+                    pipeline.sentences.empty(),
+                )
+                self._set_state("ERROR")
+                self._wait_or_stop(0.75)
+            else:
+                self.context.append(text, pipeline.response)
+                timeline.mark("response_finished")
+                self.response_finished.emit()
+                timeline.report()
+                logger.info(
+                    "[PERF] Total response: %.2fs",
+                    timeline.elapsed("speech_finished", "response_finished") or 0.0,
+                )
+
+        self._barge_monitor.stop(session_id)
+        with self._pipeline_lock:
+            owns_session = self._pipeline is pipeline
+            if owns_session:
+                self._pipeline = None
+                self._active_session_id = None
+        if owns_session:
             self.audio.clear_pending_frames()
-            with self._pipeline_lock:
-                if self._pipeline is pipeline:
-                    self._pipeline = None
-                    self._active_session_id = None
             if not self._stop_event.is_set():
                 try:
                     self.player.reset_cancellation()
                 except TTSError:
                     logger.exception("Could not reset TTS cancellation state")
-            self._set_state("LISTENING")
-            if self._interrupted_session_id == session_id:
+                self._set_state("LISTENING")
+            if interrupted:
                 logger.info("[BARGE] LISTENING")
 
     def _handle_barge_in(self, session_id: int, command: str) -> None:
@@ -761,7 +1061,11 @@ class VoiceController(QObject):
         with self._pipeline_lock:
             if self._active_session_id == session_id:
                 self._active_session_id = None
+            if self._pipeline is pipeline:
+                self._pipeline = None
+        self.interrupted.emit()
         self._set_state("INTERRUPTED")
+        self._set_state("LISTENING")
 
     def _recover_microphone(self) -> bool:
         self._set_state("ERROR")
@@ -769,8 +1073,17 @@ class VoiceController(QObject):
         self.audio.stop()
         while not self._stop_event.is_set():
             try:
+                microphone_started_at = time.perf_counter()
                 self.audio.start()
                 logger.info("Microphone recovered")
+                logger.info(
+                    "[PERF] microphone_recovery: %.0f ms",
+                    (time.perf_counter() - microphone_started_at) * 1000.0,
+                )
+                with self._pipeline_lock:
+                    active_session_id = self._active_session_id
+                if active_session_id is not None and not self._stop_event.is_set():
+                    self._barge_monitor.start(active_session_id)
                 self._set_state("LISTENING")
                 return True
             except AudioError as exc:
@@ -850,6 +1163,11 @@ def main() -> int:
     previous_qt_handler = qInstallMessageHandler(handle_qt_message)
     controller.state_changed.connect(ui.set_state, Qt.QueuedConnection)
     controller.audio_level.connect(ui.set_audio_level, Qt.QueuedConnection)
+    controller.question_category.connect(ui.set_question_category, Qt.QueuedConnection)
+    controller.thinking_started.connect(ui.note_thinking, Qt.QueuedConnection)
+    controller.first_token.connect(ui.note_first_token, Qt.QueuedConnection)
+    controller.first_sentence.connect(ui.note_first_sentence, Qt.QueuedConnection)
+    controller.interrupted.connect(ui.note_interrupted, Qt.QueuedConnection)
     thread.started.connect(controller.run, Qt.QueuedConnection)
     controller.finished.connect(thread.quit, Qt.DirectConnection)
     controller.finished.connect(controller.deleteLater)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 import logging
 import math
+import os
 import queue
 import threading
 import time
@@ -29,7 +30,13 @@ VAD_AGGRESSIVENESS = 2
 PREBUFFER_MS = 300
 PREBUFFER_FRAMES = PREBUFFER_MS // FRAME_MS
 SPEECH_START_FRAMES = 3
-SILENCE_DURATION = 0.72
+try:
+    SILENCE_DURATION = max(
+        0.45,
+        min(1.20, float(os.environ.get("DUMMY_SILENCE_SECONDS", "0.60"))),
+    )
+except ValueError:
+    SILENCE_DURATION = 0.60
 SILENCE_FRAMES = math.ceil(SILENCE_DURATION * 1000 / FRAME_MS)
 MAX_UTTERANCE_SECONDS = 20.0
 
@@ -60,6 +67,8 @@ class AudioCapture:
     def __init__(self, on_level=None) -> None:
         self._frames: queue.Queue[np.ndarray] = queue.Queue(maxsize=160)
         self._events: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=16)
+        self._frame_queues: dict[str, queue.Queue[np.ndarray]] = {"default": self._frames}
+        self._event_queues: dict[str, queue.Queue[tuple[str, str]]] = {"default": self._events}
         self._stream: sd.InputStream | None = None
         self._lock = threading.RLock()
         self._accepting = False
@@ -141,17 +150,43 @@ class AudioCapture:
                 and time.monotonic() - self._last_frame_at <= max_callback_gap
             )
 
-    def read_frame(self, timeout: float = 0.2) -> np.ndarray | None:
+    def register_consumer(self, name: str, maxsize: int = 160) -> None:
+        """Create a bounded broadcast queue for one logical audio consumer."""
+        if not name or name == "default":
+            return
+        with self._lock:
+            # The legacy default queue is useful for direct callers, but the
+            # application uses named broadcast consumers. Do not leave an
+            # unconsumed legacy queue filling and reporting overflow.
+            self._frame_queues.pop("default", None)
+            self._event_queues.pop("default", None)
+            self._frame_queues.setdefault(name, queue.Queue(maxsize=maxsize))
+            self._event_queues.setdefault(name, queue.Queue(maxsize=16))
+
+    def unregister_consumer(self, name: str) -> None:
+        if not name or name == "default":
+            return
+        with self._lock:
+            frame_queue = self._frame_queues.pop(name, None)
+            self._event_queues.pop(name, None)
+        if frame_queue is not None:
+            self._clear_queue(frame_queue)
+
+    def read_frame(self, timeout: float = 0.2, consumer: str = "default") -> np.ndarray | None:
+        with self._lock:
+            frames = self._frame_queues.get(consumer, self._frames)
         try:
-            return self._frames.get(timeout=timeout)
+            return frames.get(timeout=timeout)
         except queue.Empty:
             return None
 
-    def drain_events(self) -> list[tuple[str, str]]:
+    def drain_events(self, consumer: str = "default") -> list[tuple[str, str]]:
+        with self._lock:
+            events_queue = self._event_queues.get(consumer, self._events)
         events: list[tuple[str, str]] = []
         while True:
             try:
-                events.append(self._events.get_nowait())
+                events.append(events_queue.get_nowait())
             except queue.Empty:
                 return events
 
@@ -162,9 +197,16 @@ class AudioCapture:
             return False
 
     def _clear_frames(self) -> None:
+        with self._lock:
+            queues = [self._frames, *self._frame_queues.values()]
+        for frame_queue in queues:
+            self._clear_queue(frame_queue)
+
+    @staticmethod
+    def _clear_queue(frame_queue: queue.Queue) -> None:
         while True:
             try:
-                self._frames.get_nowait()
+                frame_queue.get_nowait()
             except queue.Empty:
                 return
 
@@ -173,12 +215,15 @@ class AudioCapture:
         self._clear_frames()
 
     def _report_event(self, kind: str, message: str) -> None:
-        try:
-            self._events.put_nowait((kind, message))
-        except queue.Full:
-            # A later health check will notice an inactive stream. Do not let
-            # an error-reporting queue take down the PortAudio callback.
-            pass
+        with self._lock:
+            event_queues = list(self._event_queues.values())
+        for event_queue in event_queues:
+            try:
+                event_queue.put_nowait((kind, message))
+            except queue.Full:
+                # A later health check will notice an inactive stream. Do not
+                # let an error-reporting queue take down the PortAudio callback.
+                continue
 
     def _callback(self, indata, frames, time_info, status) -> None:
         if status:
@@ -211,25 +256,46 @@ class AudioCapture:
                     self._on_level(level)
                 except Exception as exc:
                     self._report_event("stream", f"audio level callback failed: {exc}")
-            try:
-                self._frames.put_nowait(frame)
-            except queue.Full:
-                # Preserve the newest audio and report the condition at a low
-                # rate instead of allowing callback backpressure to grow.
+            with self._lock:
+                frame_queues = list(self._frame_queues.values())
+            queue_full = False
+            for frame_queue in frame_queues:
                 try:
-                    self._frames.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self._frames.put_nowait(frame)
+                    frame_queue.put_nowait(frame)
                 except queue.Full:
-                    pass
+                    queue_full = True
+                    # Preserve the newest audio and report the condition at a
+                    # low rate instead of allowing callback backpressure to grow.
+                    try:
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        frame_queue.put_nowait(frame)
+                    except queue.Full:
+                        pass
+            if queue_full:
                 now = time.monotonic()
                 if now - self._last_overflow_report >= 2.0:
                     self._last_overflow_report = now
                     self._report_event("overflow", "audio frame queue full")
         except Exception as exc:
             self._report_event("stream", f"microphone callback failed: {exc}")
+
+
+def _read_frame(capture, consumer: str, timeout: float = 0.2):
+    """Read a named broadcast queue while keeping simple test doubles compatible."""
+    try:
+        return capture.read_frame(timeout=timeout, consumer=consumer)
+    except TypeError:
+        return capture.read_frame(timeout=timeout)
+
+
+def _drain_events(capture, consumer: str):
+    try:
+        return capture.drain_events(consumer=consumer)
+    except TypeError:
+        return capture.drain_events()
 
 
 class UtteranceDetector:
@@ -248,6 +314,7 @@ class UtteranceDetector:
         on_speech_detected=None,
         ignore_until: float = 0.0,
         max_utterance_seconds: float = MAX_UTTERANCE_SECONDS,
+        consumer: str = "default",
     ) -> np.ndarray | None:
         prebuffer: deque[np.ndarray] = deque(maxlen=PREBUFFER_FRAMES)
         utterance: list[np.ndarray] = []
@@ -260,10 +327,10 @@ class UtteranceDetector:
             if time.monotonic() < ignore_until:
                 # Consume the short speaker-start guard without allowing
                 # Dummy's own audio into the interruption pre-buffer.
-                capture.read_frame(timeout=0.1)
+                _read_frame(capture, consumer)
                 continue
 
-            for kind, message in capture.drain_events():
+            for kind, message in _drain_events(capture, consumer):
                 if kind == "overflow":
                     logger.warning("Audio input overflow; continuing")
                 else:
@@ -274,7 +341,7 @@ class UtteranceDetector:
             if hasattr(capture, "is_healthy") and not capture.is_healthy():
                 raise AudioError("microphone stream stopped delivering audio")
 
-            frame = capture.read_frame()
+            frame = _read_frame(capture, consumer)
             if frame is None:
                 continue
 
@@ -335,6 +402,7 @@ class BargeInDetector:
         on_segment,
         on_speech_detected=None,
         ignore_until=0.0,
+        consumer: str = "default",
     ) -> None:
         """Run until the current speech ends or ``on_segment`` confirms control.
 
@@ -369,10 +437,10 @@ class BargeInDetector:
         while not stop_event.is_set():
             if time.monotonic() < current_ignore_until():
                 reset_segment()
-                capture.read_frame(timeout=0.1)
+                _read_frame(capture, consumer)
                 continue
 
-            for kind, message in capture.drain_events():
+            for kind, message in _drain_events(capture, consumer):
                 if kind == "overflow":
                     logger.warning("Audio input overflow during barge-in; continuing")
                 else:
@@ -383,7 +451,7 @@ class BargeInDetector:
             if hasattr(capture, "is_healthy") and not capture.is_healthy():
                 raise AudioError("microphone stream stopped delivering audio")
 
-            frame = capture.read_frame()
+            frame = _read_frame(capture, consumer)
             if frame is None:
                 continue
 
@@ -472,6 +540,7 @@ class WhisperTranscriber:
         self,
         audio: np.ndarray,
         stop_event: threading.Event | None = None,
+        on_first_result=None,
     ) -> str:
         if audio.size == 0:
             return ""
@@ -494,6 +563,8 @@ class WhisperTranscriber:
             for segment in segments:
                 if stop_event is not None and stop_event.is_set():
                     return ""
+                if not text_parts and on_first_result:
+                    on_first_result()
                 text_parts.append(segment.text)
             return " ".join(text_parts).strip()
         except Exception as exc:

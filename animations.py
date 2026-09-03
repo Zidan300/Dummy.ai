@@ -31,6 +31,15 @@ STATE_COLORS = {
     "STOPPED": (49.0, 65.0, 100.0),
 }
 
+CATEGORY_PROFILES = {
+    "TECHNICAL": (1.08, 1.08),
+    "COMPLEX": (1.16, 1.18),
+    "FACTUAL": (1.00, 0.96),
+    "CREATIVE": (1.04, 0.90),
+    "COMMAND": (1.12, 1.24),
+    "CASUAL": (0.94, 0.88),
+}
+
 
 class VisualAnimator:
     """Frame-rate independent visual state used only by the Qt paint timer."""
@@ -48,6 +57,10 @@ class VisualAnimator:
         self._accent_target = self._accent
         self.state_age = 0.0
         self._interrupt_impulse = 0.0
+        self.category = "CASUAL"
+        self._category_energy = 0.94
+        self._category_speed = 0.88
+        self._activity_impulse = 0.0
 
     def set_state(self, state: str) -> None:
         normalized = state.upper()
@@ -63,16 +76,28 @@ class VisualAnimator:
         """Accept a UI-safe level from the existing microphone signal."""
         self._audio_target = max(0.0, min(1.0, float(level)))
 
+    def set_category(self, category: str) -> None:
+        normalized = category.upper()
+        if normalized not in CATEGORY_PROFILES:
+            normalized = "CASUAL"
+        self.category = normalized
+
+    def note_activity(self, amount: float = 0.35) -> None:
+        self._activity_impulse = max(self._activity_impulse, min(1.0, float(amount)))
+
     def tick(self, elapsed: float) -> None:
         elapsed = max(0.0, min(0.05, float(elapsed)))
         self.time += elapsed
         self.state_age += elapsed
         target_energy, target_speed, target_scale, target_wave = STATE_PROFILES[self.state]
+        target_category_energy, target_category_speed = CATEGORY_PROFILES[self.category]
         smoothing = 1.0 - math.exp(-elapsed * 8.0)
         self.energy += (target_energy - self.energy) * smoothing
         self.speed += (target_speed - self.speed) * smoothing
         self.scale += (target_scale - self.scale) * smoothing
         self.wave += (target_wave - self.wave) * smoothing
+        self._category_energy += (target_category_energy - self._category_energy) * smoothing
+        self._category_speed += (target_category_speed - self._category_speed) * smoothing
         audio_rate = 18.0 if self._audio_target > self.audio_level else 5.0
         audio_smoothing = 1.0 - math.exp(-elapsed * audio_rate)
         self.audio_level += (self._audio_target - self.audio_level) * audio_smoothing
@@ -82,21 +107,22 @@ class VisualAnimator:
             for current, target in zip(self._accent, self._accent_target)
         )
         self._interrupt_impulse *= math.exp(-elapsed * 7.0)
+        self._activity_impulse *= math.exp(-elapsed * 5.5)
 
     @property
     def pulse(self) -> float:
         idle_breath = math.sin(self.time * 1.35) * 0.035
-        active_breath = math.sin(self.time * (2.0 + self.speed)) * 0.055 * self.energy
+        active_breath = math.sin(self.time * (2.0 + self.speed)) * 0.055 * self.energy * self._category_energy
         audio_reaction = self.audio_level * (0.20 if self.state == "LISTENING" else 0.12)
-        return idle_breath + active_breath + audio_reaction + self._interrupt_impulse * 0.10
+        return idle_breath + active_breath + audio_reaction + self._interrupt_impulse * 0.10 + self._activity_impulse * 0.08
 
     @property
     def rotation(self) -> float:
-        return self.time * self.speed * 18.0
+        return self.time * self.speed * self._category_speed * 18.0
 
     @property
     def flow(self) -> float:
-        return self.time * (0.7 + self.speed * 1.8)
+        return self.time * (0.7 + self.speed * 1.8 * self._category_speed)
 
     @property
     def collapse(self) -> float:
@@ -119,8 +145,8 @@ class VisualAnimator:
         """State-aware orbital detail, kept bounded for inexpensive painting."""
         if self.state in {"SHUTTING_DOWN", "STOPPED"}:
             return self.energy * 0.35
-        return min(1.0, self.energy + self.audio_level * 0.25)
+        return min(1.0, self.energy * self._category_energy + self.audio_level * 0.25 + self._activity_impulse * 0.18)
 
     @property
     def spark_energy(self) -> float:
-        return min(1.0, self.energy * 0.72 + self.audio_level * 0.38)
+        return min(1.0, self.energy * 0.72 * self._category_energy + self.audio_level * 0.38 + self._activity_impulse * 0.12)

@@ -118,6 +118,25 @@ def classify_intent(text: str) -> str:
     return "CONVERSATION"
 
 
+def classify_question_category(text: str) -> str:
+    """Choose a lightweight visual mood without another model request."""
+    normalized = normalize_spoken_text(text)
+    lower = text.strip().lower()
+    if classify_intent(text) == "COMMAND":
+        return "COMMAND"
+    if any(marker in lower for marker in ("in detail", "deep dive", "step by step", "everything about")):
+        return "COMPLEX"
+    if any(word in normalized.split() for word in (
+        "python", "docker", "api", "code", "git", "linux", "dns", "cpu", "ram", "server", "database",
+    )):
+        return "TECHNICAL"
+    if any(lower.startswith(prefix) for prefix in ("write ", "imagine ", "create a story", "give me an idea")):
+        return "CREATIVE"
+    if classify_intent(text) == "QUESTION":
+        return "FACTUAL"
+    return "CASUAL"
+
+
 @dataclass(frozen=True)
 class ConversationTurn:
     user: str

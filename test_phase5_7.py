@@ -5,15 +5,22 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+import wave
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from unittest.mock import patch
 
 import numpy as np
 
 from animations import VisualAnimator
 from audio import AudioCapture, BargeInDetector, FRAME_SIZE
-from context import classify_intent, is_exit_command, is_interruption_command
-from main import ResponsePipeline, VoiceController
+from context import (
+    classify_intent,
+    classify_question_category,
+    is_exit_command,
+    is_interruption_command,
+)
+from main import NormalSpeechMonitor, PerformanceTimeline, ResponsePipeline, VoiceController
 import tts as tts_module
 
 
@@ -22,9 +29,22 @@ class FakePlayer:
         self.cancelled = False
         self.played: list[str] = []
 
-    def speak(self, text, cancel_event=None, on_playback_start=None):
+    def speak(
+        self,
+        text,
+        cancel_event=None,
+        on_piper_start=None,
+        on_audio_ready=None,
+        on_playback_start=None,
+        on_playback_level=None,
+    ):
+        del on_playback_level
         if self.cancelled or (cancel_event and cancel_event.is_set()):
             return False
+        if on_piper_start:
+            on_piper_start()
+        if on_audio_ready:
+            on_audio_ready()
         self.played.append(text)
         if on_playback_start:
             on_playback_start()
@@ -34,15 +54,31 @@ class FakePlayer:
         self.cancelled = True
         return bool(self.played)
 
+    def reset_cancellation(self):
+        self.cancelled = False
+
 
 class BlockingPlayer(FakePlayer):
     def __init__(self) -> None:
         super().__init__()
         self.started = threading.Event()
 
-    def speak(self, text, cancel_event=None, on_playback_start=None):
+    def speak(
+        self,
+        text,
+        cancel_event=None,
+        on_piper_start=None,
+        on_audio_ready=None,
+        on_playback_start=None,
+        on_playback_level=None,
+    ):
+        del on_playback_level
         if self.cancelled or (cancel_event and cancel_event.is_set()):
             return False
+        if on_piper_start:
+            on_piper_start()
+        if on_audio_ready:
+            on_audio_ready()
         self.played.append(text)
         self.started.set()
         if on_playback_start:
@@ -76,6 +112,20 @@ class CommandRegressionTests(unittest.TestCase):
         self.assertGreater(levels[0], 0.0)
         self.assertLessEqual(levels[0], 1.0)
         self.assertIsNotNone(capture.read_frame(timeout=0.01))
+
+    def test_one_microphone_frame_is_broadcast_to_normal_and_barge_consumers(self):
+        capture = AudioCapture()
+        capture.register_consumer("normal")
+        capture.register_consumer("barge")
+        capture._accepting = True
+        frame = np.full((FRAME_SIZE, 1), 1024, dtype=np.int16)
+        capture._callback(frame, FRAME_SIZE, None, None)
+
+        normal = capture.read_frame(timeout=0.01, consumer="normal")
+        barge = capture.read_frame(timeout=0.01, consumer="barge")
+        self.assertIsNotNone(normal)
+        self.assertIsNotNone(barge)
+        np.testing.assert_array_equal(normal, barge)
 
     def test_barge_command_requires_pause_confirmation(self):
         class FakeTranscriber:
@@ -140,6 +190,103 @@ class CommandRegressionTests(unittest.TestCase):
         self.assertFalse(segments[0][1])
         self.assertGreaterEqual(len(segments[0][0]), FRAME_SIZE)
 
+    def test_question_categories_are_deterministic_and_lightweight(self):
+        self.assertEqual(classify_question_category("What is Docker?"), "TECHNICAL")
+        self.assertEqual(classify_question_category("Explain this in detail"), "COMPLEX")
+        self.assertEqual(classify_question_category("Write a short poem"), "CREATIVE")
+        self.assertEqual(classify_question_category("What time is it?"), "FACTUAL")
+        self.assertEqual(classify_question_category("How are you?"), "CASUAL")
+
+    def test_normal_monitor_stays_alive_until_shutdown_and_uses_named_queue(self):
+        class FakeCapture:
+            def register_consumer(self, name):
+                self.consumer = name
+
+            def clear_pending_frames(self):
+                pass
+
+        class FakeDetector:
+            def listen(self, capture, stop_event, **kwargs):
+                self.consumer = kwargs["consumer"]
+                started.set()
+                while not stop_event.is_set():
+                    time.sleep(0.005)
+                return None
+
+        started = threading.Event()
+        app_stop = threading.Event()
+        capture = FakeCapture()
+        detector = FakeDetector()
+        monitor = NormalSpeechMonitor(
+            capture,
+            detector,
+            app_stop,
+            lambda utterance, timeline: None,
+            lambda exc: self.fail(f"normal monitor error: {exc}"),
+            lambda timeline: None,
+            lambda timeline: None,
+        )
+        monitor.start()
+        self.assertTrue(started.wait(1.0))
+        self.assertEqual(detector.consumer, "normal")
+        self.assertTrue(monitor.is_alive())
+        monitor.stop()
+        self.assertFalse(monitor.is_alive())
+
+
+class PerformanceRegressionTests(unittest.TestCase):
+    def test_timeline_uses_monotonic_marks_and_reports_stage_durations(self):
+        values = iter((10.0, 10.1, 10.4, 10.6, 11.0, 11.2))
+        timeline = PerformanceTimeline(clock=lambda: next(values))
+        timeline.mark("speech_finished")
+        timeline.mark("whisper_finished")
+        timeline.mark("gemma_started")
+        timeline.mark("first_token")
+        timeline.mark("first_sentence")
+        timeline.mark("playback_started")
+
+        self.assertAlmostEqual(timeline.elapsed("speech_finished", "whisper_finished"), 0.1)
+        self.assertAlmostEqual(timeline.elapsed("gemma_started", "first_token"), 0.2)
+        self.assertAlmostEqual(timeline.elapsed("speech_finished", "playback_started"), 1.2)
+
+    def test_pipeline_exposes_generation_to_audio_stage_callbacks(self):
+        events = []
+        piper_started = threading.Event()
+
+        def fake_stream(prompt, on_token, cancel_event):
+            del prompt, cancel_event
+            events.append("generation_started")
+            on_token("The answer is concise. ")
+            self.assertTrue(piper_started.wait(1.0))
+            events.append("generation_continues")
+            on_token("The second sentence follows.")
+            events.append("generation_finished")
+            return "The answer is concise. The second sentence follows."
+
+        player = FakePlayer()
+        pipeline = ResponsePipeline(
+            "test",
+            threading.Event(),
+            player,
+            lambda: events.append("first_token"),
+            lambda: events.append("first_sentence"),
+            lambda: events.append("playback_started"),
+            lambda exc: self.fail(f"pipeline error: {exc}"),
+            on_generation_started=lambda: events.append("gemma_started"),
+            on_piper_started=lambda: (events.append("piper_started"), piper_started.set()),
+            on_audio_ready=lambda: events.append("audio_ready"),
+        )
+        with patch("main.stream_dummy", side_effect=fake_stream):
+            pipeline.start()
+            pipeline.wait()
+
+        self.assertTrue(pipeline.generation_succeeded)
+        self.assertTrue(pipeline.tts_succeeded)
+        self.assertLess(events.index("first_sentence"), events.index("generation_finished"))
+        self.assertLess(events.index("piper_started"), events.index("generation_finished"))
+        self.assertLess(events.index("audio_ready"), events.index("generation_finished"))
+        self.assertEqual(events.count("playback_started"), 1)
+
 
 class ResponsePipelineRegressionTests(unittest.TestCase):
     def _pipeline(self, stream, player=None):
@@ -180,6 +327,8 @@ class ResponsePipelineRegressionTests(unittest.TestCase):
 
     def test_controller_invalidates_active_session_on_stop(self):
         controller = VoiceController()
+        states = []
+        controller.state_changed.connect(states.append)
         pipeline = ResponsePipeline(
             "test",
             controller.stop_event,
@@ -198,7 +347,41 @@ class ResponsePipelineRegressionTests(unittest.TestCase):
         self.assertTrue(pipeline.is_cancelled())
         self.assertEqual(controller._active_session_id, None)
         self.assertEqual(controller._interrupted_session_id, 41)
-        self.assertEqual(controller._state, "INTERRUPTED")
+        self.assertEqual(states[-2:], ["INTERRUPTED", "LISTENING"])
+        self.assertEqual(controller._state, "LISTENING")
+        controller._queue_normal_utterance(np.ones(480, dtype=np.float32), PerformanceTimeline())
+        self.assertEqual(controller._utterances.qsize(), 1)
+
+    def test_controller_does_not_block_on_response_playback(self):
+        controller = VoiceController()
+        controller.transcriber = type(
+            "FakeTranscriber",
+            (),
+            {"transcribe": lambda self, audio, stop_event, on_first_result=None: "What is Python?"},
+        )()
+        controller.player = FakePlayer()
+        timeline = PerformanceTimeline()
+        timeline.mark("speech_finished")
+
+        with patch(
+            "main.stream_dummy",
+            side_effect=lambda prompt, on_token, cancel_event, history=None: (
+                on_token("Python is a programming language."),
+                "Python is a programming language.",
+            )[1],
+        ):
+            started_at = time.perf_counter()
+            controller._process_utterance(np.ones(480, dtype=np.float32), timeline)
+            return_latency = time.perf_counter() - started_at
+
+            self.assertLess(return_latency, 0.20)
+            deadline = time.monotonic() + 1.0
+            while controller._pipeline is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        self.assertIsNone(controller._pipeline)
+        self.assertEqual(controller._state, "LISTENING")
+        self.assertEqual(controller.player.played, ["Python is a programming language."])
 
     def test_controller_keeps_exit_as_shutdown(self):
         controller = VoiceController()
@@ -363,6 +546,19 @@ class TTSRegressionTests(unittest.TestCase):
         ffplay = self.FakeProcess.instances[-1]
         self.assertTrue(ffplay.terminated)
         self.assertFalse(Path(ffplay.args[3]).exists())
+
+    def test_playback_meter_reports_real_wav_level(self):
+        with NamedTemporaryFile(suffix=".wav") as wav_file:
+            with wave.open(wav_file.name, "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(1000)
+                output.writeframes((10000).to_bytes(2, "little", signed=True) * 50)
+            meter = tts_module._WaveLevelMeter(wav_file.name)
+            try:
+                self.assertGreater(meter.level_at(0.05), 0.0)
+            finally:
+                meter.close()
 
 
 if __name__ == "__main__":

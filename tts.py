@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import logging
+from array import array
+import math
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import wave
 
 
 logger = logging.getLogger(__name__)
@@ -46,13 +50,23 @@ class SpeechPlayer:
             ffplay_active = self._ffplay_process is not None and self._ffplay_process.poll() is None
         for process in processes:
             self._terminate(process)
+        # The OS processes are stopped synchronously above. Remove them from
+        # the ownership set immediately so a new post-interruption response
+        # does not lose a race with the old worker's final cleanup.
+        with self._lock:
+            self._processes.difference_update(processes)
+            if self._ffplay_process in processes:
+                self._ffplay_process = None
         return ffplay_active
 
     def speak(
         self,
         text: str,
         cancel_event: threading.Event | None = None,
+        on_piper_start=None,
+        on_audio_ready=None,
         on_playback_start=None,
+        on_playback_level=None,
     ) -> bool:
         text = text.strip()
         if not text or self._cancelled(cancel_event):
@@ -68,6 +82,8 @@ class SpeechPlayer:
             ) as wav_file:
                 wav_path = wav_file.name
 
+            if on_piper_start:
+                on_piper_start()
             piper = self._start(
                 [PIPER, "-m", MODEL, "-f", wav_path],
                 stdin=subprocess.PIPE,
@@ -88,8 +104,8 @@ class SpeechPlayer:
             if self._cancelled(cancel_event):
                 return False
 
-            if on_playback_start:
-                on_playback_start()
+            if on_audio_ready:
+                on_audio_ready()
             player = self._start(
                 [
                     FFPLAY,
@@ -102,7 +118,14 @@ class SpeechPlayer:
             with self._lock:
                 self._ffplay_process = player
             try:
-                if not self._wait(player, cancel_event):
+                if on_playback_start:
+                    on_playback_start()
+                if not self._wait(
+                    player,
+                    cancel_event,
+                    wav_path=wav_path,
+                    on_playback_level=on_playback_level,
+                ):
                     return False
                 if player.returncode != 0:
                     raise TTSError(self._failure_message("ffplay", player))
@@ -140,13 +163,41 @@ class SpeechPlayer:
             self._processes.add(process)
         return process
 
-    def _wait(self, process: subprocess.Popen, external: threading.Event | None) -> bool:
-        while process.poll() is None:
-            if self._cancelled(external):
-                self._terminate(process)
-                return False
-            time.sleep(0.05)
-        return not self._cancelled(external)
+    def _wait(
+        self,
+        process: subprocess.Popen,
+        external: threading.Event | None,
+        wav_path: str | None = None,
+        on_playback_level=None,
+    ) -> bool:
+        meter = None
+        if wav_path and on_playback_level:
+            try:
+                meter = _WaveLevelMeter(wav_path)
+            except (OSError, ValueError, wave.Error):
+                # Telemetry is optional; a malformed/unavailable WAV must not
+                # change the outcome of otherwise valid playback.
+                logger.debug("Could not open WAV for playback level", exc_info=True)
+        started_at = time.monotonic()
+        try:
+            while process.poll() is None:
+                if self._cancelled(external):
+                    self._terminate(process)
+                    return False
+                if meter is not None:
+                    try:
+                        on_playback_level(meter.level_at(time.monotonic() - started_at))
+                    except (OSError, ValueError, wave.Error):
+                        logger.debug("Could not measure TTS playback level", exc_info=True)
+                        meter.close()
+                        meter = None
+                time.sleep(0.05)
+            if on_playback_level:
+                on_playback_level(0.0)
+            return not self._cancelled(external)
+        finally:
+            if meter is not None:
+                meter.close()
 
     def _forget(self, process: subprocess.Popen) -> None:
         with self._lock:
@@ -176,6 +227,51 @@ class SpeechPlayer:
                 process.wait(timeout=0.75)
             except (OSError, subprocess.TimeoutExpired):
                 logger.error("Speech process did not stop cleanly")
+
+
+class _WaveLevelMeter:
+    """Read small sequential WAV windows for UI-only output amplitude."""
+
+    def __init__(self, path: str) -> None:
+        self._wave = wave.open(path, "rb")
+        self._rate = self._wave.getframerate()
+        self._width = self._wave.getsampwidth()
+        self._channels = self._wave.getnchannels()
+        self._read_frames = 0
+
+    def close(self) -> None:
+        self._wave.close()
+
+    def level_at(self, elapsed: float) -> float:
+        target_frames = max(self._read_frames, int(max(0.0, elapsed) * self._rate))
+        frames_to_read = min(target_frames - self._read_frames, max(1, self._rate // 20))
+        if frames_to_read <= 0:
+            return 0.0
+        data = self._wave.readframes(frames_to_read)
+        actual_frames = len(data) // max(1, self._width * self._channels)
+        self._read_frames += actual_frames
+        if not data or actual_frames <= 0:
+            return 0.0
+        values = self._samples(data)
+        if not values:
+            return 0.0
+        rms = math.sqrt(sum(value * value for value in values) / len(values))
+        peak = float((1 << (8 * self._width - 1)) - 1)
+        return min(1.0, rms / max(1.0, peak) * 4.0)
+
+    def _samples(self, data: bytes) -> list[int]:
+        if self._width == 1:
+            return [sample - 128 for sample in data]
+        if self._width == 2:
+            values = array("h")
+        elif self._width == 4:
+            values = array("i")
+        else:
+            return []
+        values.frombytes(data[: len(data) - (len(data) % values.itemsize)])
+        if getattr(values, "itemsize", 0) and sys.byteorder != "little":
+            values.byteswap()
+        return list(values)
 
 
 _default_player = SpeechPlayer()

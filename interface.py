@@ -81,8 +81,28 @@ class DummyInterface(QWidget):
         self.update()
 
     def set_audio_level(self, level: float) -> None:
-        """Optional GUI-thread slot for a safely exposed audio level."""
+        """GUI-thread slot for microphone or TTS RMS levels."""
         self._animator.set_audio_level(level)
+
+    def set_question_category(self, category: str) -> None:
+        """Set a subtle visual mood from deterministic controller metadata."""
+        self._animator.set_category(category)
+
+    def note_activity(self, amount: float = 0.35) -> None:
+        """Receive progress pulses through a queued Qt connection."""
+        self._animator.note_activity(amount)
+
+    def note_thinking(self) -> None:
+        self.note_activity(0.30)
+
+    def note_first_token(self) -> None:
+        self.note_activity(0.48)
+
+    def note_first_sentence(self) -> None:
+        self.note_activity(0.68)
+
+    def note_interrupted(self) -> None:
+        self.note_activity(0.90)
 
     def animate(self) -> None:
         now = time.monotonic()
