@@ -16,6 +16,7 @@ from ai import (
     AIError,
     SentenceBuffer,
     clean_for_speech,
+    local_reference_response,
     stream_dummy,
     unsupported_command_response,
 )
@@ -560,9 +561,9 @@ class VoiceController(QObject):
             return
 
         history = self.context.snapshot()
-        response_override = (
-            unsupported_command_response(text) if intent == "COMMAND" else None
-        )
+        response_override = local_reference_response(text, history)
+        if response_override is None and intent == "COMMAND":
+            response_override = unsupported_command_response(text)
 
         self._set_state("THINKING")
         with self._pipeline_lock:

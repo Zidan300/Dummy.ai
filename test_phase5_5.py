@@ -66,6 +66,23 @@ class ResponseQualityTests(unittest.TestCase):
         self.assertIn("Never invent facts", ai.SYSTEM_PROMPT)
         self.assertIn("what did I just", ai.SYSTEM_PROMPT)
         self.assertIn("step-by-step", ai.SYSTEM_PROMPT)
+        self.assertIn("primary request", ai.SYSTEM_PROMPT)
+
+    def test_reliable_references_can_be_answered_locally(self):
+        context = ConversationContext()
+        context.append("What is Docker?", "Docker packages apps into containers.")
+        self.assertEqual(
+            ai.local_reference_response("What did I just ask?", context.snapshot()),
+            "You just said, What is Docker?",
+        )
+        self.assertEqual(
+            ai.local_reference_response("What did you say?", context.snapshot()),
+            "I said, Docker packages apps into containers.",
+        )
+        self.assertEqual(
+            ai.local_reference_response("What did I just say?", None),
+            "I don't have an earlier user message in this session.",
+        )
 
     def test_context_is_sent_before_current_message(self):
         context = ConversationContext()

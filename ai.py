@@ -49,10 +49,12 @@ tool did it.
 
 Conversation history, when present, is only for resolving references such as
 it, that, they, the first one, and follow-up questions. It comes before the
-current user message and must not override that message. For "what did I just
-say?", use the most recent earlier user message in the history, not the
-question itself. For "what did you say?", use the most recent earlier Dummy
-reply. If the needed context is unavailable, say so honestly."""
+current user message. The current user message is always the primary request;
+answer it even when the user changes topic. Do not repeat old context unless
+it is relevant. For "what did I just say?", use the most recent earlier user
+message in the history, not the question itself. For "what did you say?", use
+the most recent earlier Dummy reply. If the needed context is unavailable, say
+so honestly."""
 
 
 class AIError(RuntimeError):
@@ -92,6 +94,24 @@ def clean_for_speech(text: str) -> str:
     }))
     cleaned = re.sub(r"[^\w\s.,!?;:'\"()/%+$&-]", " ", cleaned, flags=re.UNICODE)
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def local_reference_response(
+    user_message: str,
+    history: Sequence[ConversationTurn] | None = None,
+) -> str | None:
+    """Answer reliable conversation-reference questions without Gemma."""
+    normalized = " ".join(re.findall(r"[a-z0-9]+", user_message.lower()))
+    turns = list(history or ())
+    if normalized in {"what did i just say", "what did i just ask", "what did i say"}:
+        if not turns:
+            return "I don't have an earlier user message in this session."
+        return f"You just said, {turns[-1].user}"
+    if normalized in {"what did you say", "what did dummy say"}:
+        if not turns:
+            return "I don't have an earlier reply in this session."
+        return f"I said, {turns[-1].assistant}"
+    return None
 
 
 def unsupported_command_response(command: str) -> str:
