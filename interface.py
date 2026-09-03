@@ -13,7 +13,7 @@ import random
 import sys
 import time
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -44,6 +44,7 @@ class DummyInterface(QWidget):
         self.resize(1000, 700)
         self.setMinimumSize(720, 560)
         self.setFocusPolicy(Qt.StrongFocus)
+        QApplication.instance().installEventFilter(self)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAutoFillBackground(False)
 
@@ -88,6 +89,18 @@ class DummyInterface(QWidget):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_S
+            and not event.isAutoRepeat()
+            and self.isActiveWindow()
+        ):
+            self.interrupt_requested.emit()
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
 
     # -- Qt-thread-safe signal slots (GUI thread only) ----------------------
     def set_state(self, state: str) -> None:

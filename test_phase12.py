@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QCoreApplication, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
@@ -87,12 +87,40 @@ class KeyboardInterruptionTests(unittest.TestCase):
 
     def test_s_key_emits_only_for_physical_non_repeat_key(self):
         widget = DummyInterface()
+        widget.show()
+        widget.activateWindow()
+        widget.setFocus()
         events = []
         widget.interrupt_requested.connect(lambda: events.append(True))
-        widget.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_S, Qt.NoModifier, "s", False))
-        widget.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_S, Qt.NoModifier, "s", True))
-        widget.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_A, Qt.NoModifier, "a", False))
+        QCoreApplication.sendEvent(
+            widget,
+            QKeyEvent(QEvent.KeyPress, Qt.Key_S, Qt.NoModifier, "s", False),
+        )
+        QCoreApplication.sendEvent(
+            widget,
+            QKeyEvent(QEvent.KeyPress, Qt.Key_S, Qt.NoModifier, "S", True),
+        )
+        QCoreApplication.sendEvent(
+            widget,
+            QKeyEvent(QEvent.KeyPress, Qt.Key_A, Qt.NoModifier, "a", False),
+        )
         self.assertEqual(events, [True])
+        widget.close()
+
+    def test_s_key_signal_reaches_controller(self):
+        widget = DummyInterface()
+        controller, pipeline = self._controller_with_pipeline("SPEAKING")
+        widget.interrupt_requested.connect(controller.keyboard_interrupt, Qt.QueuedConnection)
+        widget.show()
+        widget.activateWindow()
+        widget.setFocus()
+        QCoreApplication.sendEvent(
+            widget,
+            QKeyEvent(QEvent.KeyPress, Qt.Key_S, Qt.NoModifier, "s", False),
+        )
+        self.app.processEvents()
+        self.assertTrue(pipeline.is_cancelled())
+        self.assertEqual(controller._state, "LISTENING")
         widget.close()
 
     def test_controller_keeps_one_persistent_microphone(self):
