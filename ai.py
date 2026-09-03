@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 from collections.abc import Sequence
@@ -13,7 +14,7 @@ from context import ConversationTurn
 
 
 logger = logging.getLogger(__name__)
-MODEL = "gemma3:4b"
+MODEL = os.getenv("DUMMY_MODEL", "dummy-gemma")
 MIN_SENTENCE_CHARS = 8
 _SENTENCE_END = re.compile(r"[.!?]+(?:[\"')\]]+)?(?=\s|$)")
 
