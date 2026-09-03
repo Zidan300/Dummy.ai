@@ -113,6 +113,14 @@ class PerformanceTimeline:
             duration = self.elapsed(start, end)
             if duration is not None:
                 logger.info("[PERF] %s: %.0f ms", label, duration * 1000.0)
+        for label, end in (
+            ("barge_in_to_whisper", "whisper_finished"),
+            ("barge_in_to_first_token", "first_token"),
+            ("barge_in_to_first_audio", "playback_started"),
+        ):
+            duration = self.elapsed("speech_detected", end)
+            if duration is not None:
+                logger.info("[PERF] %s: %.2fs", label, duration)
 
 
 class ResponsePipeline:
@@ -399,7 +407,7 @@ class NormalSpeechMonitor:
         if register is not None:
             register(self.CONSUMER)
 
-    def start(self) -> None:
+    def start(self, initial_audio=None, detected_at: float | None = None) -> None:
         self.stop()
         self.capture.clear_pending_frames()
         local_stop = threading.Event()
@@ -407,7 +415,7 @@ class NormalSpeechMonitor:
             self._stop_event = local_stop
             self._thread = threading.Thread(
                 target=self._run,
-                args=(local_stop,),
+                args=(local_stop, initial_audio, detected_at),
                 name="dummy-normal-listener",
                 daemon=False,
             )
@@ -435,7 +443,7 @@ class NormalSpeechMonitor:
         with self._lock:
             return bool(self._thread and self._thread.is_alive())
 
-    def _run(self, local_stop: threading.Event) -> None:
+    def _run(self, local_stop: threading.Event, initial_audio=None, detected_at: float | None = None) -> None:
         try:
             while not self.app_stop_event.is_set() and not local_stop.is_set():
                 if not self.can_listen():
@@ -452,6 +460,9 @@ class NormalSpeechMonitor:
                     self.can_listen,
                 )
                 timeline = PerformanceTimeline()
+                if detected_at is not None:
+                    timeline.started_at = detected_at
+                    timeline.marks["speech_detected"] = detected_at
 
                 def speech_started() -> None:
                     logger.info("Speech detected")
@@ -465,6 +476,7 @@ class NormalSpeechMonitor:
                         on_speech_detected=speech_started,
                         consumer=self.CONSUMER,
                         on_utterance_info=self.on_utterance_info,
+                        initial_audio=initial_audio,
                     )
                 except (AudioError, VadError) as exc:
                     if cancel.is_set():
@@ -478,22 +490,25 @@ class NormalSpeechMonitor:
                     timeline.mark("speech_finished")
                     self.on_speech_ended(timeline)
                     self.on_utterance(utterance, timeline)
+                initial_audio = None
+                detected_at = None
         except Exception as exc:
             if not self.app_stop_event.is_set() and not local_stop.is_set():
                 self.on_error(exc)
 
 
 class BargeInMonitor:
-    """Recognize explicit control phrases on a short rolling VAD path."""
+    """Detect confident human speech while a response is being produced."""
 
     SPEAKER_START_GUARD_SECONDS = 0.45
     CONSUMER = "barge"
 
-    def __init__(self, capture, transcriber, app_stop_event, on_command) -> None:
+    def __init__(self, capture, transcriber, app_stop_event, on_command, on_speech_started=None) -> None:
         self.capture = capture
         self.transcriber = transcriber
         self.app_stop_event = app_stop_event
         self.on_command = on_command
+        self.on_speech_started = on_speech_started
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
@@ -557,7 +572,7 @@ class BargeInMonitor:
                     detector.listen_for_segments(
                         self.capture,
                         cancel,
-                        on_speech_detected=lambda: logger.info("[BARGE] speech detected"),
+                        on_speech_detected=lambda audio: self._speech_started(session_id, audio),
                         on_segment=lambda audio, pause_confirmed: self._recognize_segment(
                             session_id,
                             audio,
@@ -576,6 +591,11 @@ class BargeInMonitor:
         except Exception as exc:
             if not cancel.is_set():
                 logger.exception("[BARGE] worker failed: %s", exc)
+
+    def _speech_started(self, session_id: int, audio) -> None:
+        logger.info("[BARGE] confirmed human speech")
+        if self.on_speech_started:
+            self.on_speech_started(session_id, audio)
 
     def _recognize_segment(
         self,
@@ -654,6 +674,7 @@ class VoiceController(QObject):
             self.transcriber,
             self._stop_event,
             self._handle_barge_in,
+            self._handle_natural_barge_in,
         )
         self._normal_monitor: NormalSpeechMonitor | None = None
 
@@ -1146,6 +1167,41 @@ class VoiceController(QObject):
         self.interrupted.emit()
         self._set_state("INTERRUPTED")
         self._set_state("LISTENING")
+
+    def _handle_natural_barge_in(self, session_id: int, initial_audio) -> None:
+        """Stop the response on speech onset, then preserve that speech."""
+        detected_at = time.perf_counter()
+        with self._pipeline_lock:
+            pipeline = self._pipeline
+            if (
+                self._active_session_id != session_id
+                or pipeline is None
+                or pipeline.is_cancelled()
+                or self._interrupted_session_id == session_id
+            ):
+                return
+            self._interrupted_session_id = session_id
+            self._interruption_started_at = detected_at
+
+        logger.info("[BARGE] natural interruption; invalidating session %s", session_id)
+        self.interrupt_tts(session_id, detected_at)
+        self._barge_monitor.request_stop(session_id)
+        with self._pipeline_lock:
+            if self._active_session_id == session_id:
+                self._active_session_id = None
+            if self._pipeline is pipeline:
+                self._pipeline = None
+        self._tts_cooldown_until = 0.0
+        self.interrupted.emit()
+        self._set_state("INTERRUPTED")
+        self._set_state("LISTENING")
+        if self._normal_monitor is not None and not self._stop_event.is_set():
+            self._normal_monitor.start(
+                initial_audio=initial_audio,
+                detected_at=detected_at,
+            )
+        logger.info("[PERF] barge_in_to_playback_stop: %.0f ms",
+                    (time.perf_counter() - detected_at) * 1000.0)
 
     def _recover_microphone(self) -> bool:
         self._set_state("ERROR")

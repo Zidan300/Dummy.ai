@@ -158,8 +158,8 @@ class CommandRegressionTests(unittest.TestCase):
 
         class FakeCapture:
             def __init__(self):
-                self.frames = [np.zeros(FRAME_SIZE, dtype=np.int16) for _ in range(16)]
-                self.frames.extend(np.zeros(FRAME_SIZE, dtype=np.int16) for _ in range(2))
+                self.frames = [np.full(FRAME_SIZE, 1024, dtype=np.int16) for _ in range(16)]
+                self.frames.extend(np.full(FRAME_SIZE, 1024, dtype=np.int16) for _ in range(2))
 
             def drain_events(self):
                 return []

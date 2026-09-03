@@ -47,6 +47,8 @@ BARGE_RECOGNITION_INTERVAL_SECONDS = 0.18
 BARGE_MAX_SEGMENT_SECONDS = 1.20
 BARGE_MAX_SEGMENT_FRAMES = math.ceil(BARGE_MAX_SEGMENT_SECONDS * 1000 / FRAME_MS)
 BARGE_CONFIRM_SILENCE_FRAMES = math.ceil(0.12 * 1000 / FRAME_MS)
+BARGE_SPEECH_START_FRAMES = 4
+BARGE_MIN_RMS = 0.008
 
 
 class AudioError(RuntimeError):
@@ -326,15 +328,24 @@ class UtteranceDetector:
         max_utterance_seconds: float = MAX_UTTERANCE_SECONDS,
         consumer: str = "default",
         on_utterance_info=None,
+        initial_audio: np.ndarray | None = None,
     ) -> np.ndarray | None:
         prebuffer: deque[np.ndarray] = deque(maxlen=PREBUFFER_FRAMES)
         utterance: list[np.ndarray] = []
         speech_run = 0
         silence_run = 0
-        speaking = False
-        started_at = 0.0
+        speaking = initial_audio is not None and initial_audio.size > 0
+        started_at = time.monotonic() if speaking else 0.0
         speech_frame_count = 0
         prebuffer_frame_count = 0
+
+        if speaking:
+            initial = np.asarray(initial_audio, dtype=np.float32)
+            utterance = [
+                np.clip(initial[offset:offset + FRAME_SIZE] * 32768.0, -32768, 32767).astype(np.int16)
+                for offset in range(0, len(initial), FRAME_SIZE)
+            ]
+            speech_frame_count = len(utterance)
 
         def finish(frames: list[np.ndarray]) -> np.ndarray:
             audio = self._to_float_audio(frames)
@@ -491,16 +502,19 @@ class BargeInDetector:
 
             if not speaking:
                 prebuffer.append(frame)
-                if is_speech:
+                frame_rms = float(np.sqrt(np.mean(np.square(frame.astype(np.float32) / 32768.0))))
+                if is_speech and frame_rms >= BARGE_MIN_RMS:
                     speech_run += 1
-                    if speech_run >= SPEECH_START_FRAMES:
+                    if speech_run >= BARGE_SPEECH_START_FRAMES:
                         speaking = True
                         speech_frames = list(prebuffer)
                         speech_duration_frames = len(speech_frames)
                         silence_run = 0
                         last_attempt_at = 0.0
                         if on_speech_detected:
-                            on_speech_detected()
+                            on_speech_detected(
+                                UtteranceDetector._to_float_audio(speech_frames)
+                            )
                 else:
                     speech_run = 0
                 continue
