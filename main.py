@@ -24,11 +24,9 @@ from audio import AudioCapture, AudioError, TranscriptionError, UtteranceDetecto
 from context import (
     ConversationContext,
     EXIT_COMMANDS,
-    INTERRUPTION_COMMANDS,
     classify_intent,
     classify_question_category,
     is_exit_command,
-    normalize_spoken_text,
 )
 from interface import DummyInterface
 from tts import SpeechPlayer, TTSError
@@ -68,37 +66,6 @@ class ConditionalCancellation:
 
     def is_set(self) -> bool:
         return any(event.is_set() for event in self._events) or not self._allowed()
-
-
-class DisabledBargeMonitor:
-    """Compatibility shim; automatic microphone interruption is disabled."""
-
-    def stop(self, session_id=None) -> None:
-        del session_id
-
-    def reset(self) -> None:
-        pass
-
-    def _recognize_segment(self, session_id, audio, cancel, pause_confirmed=False) -> bool:
-        del session_id, audio, cancel, pause_confirmed
-        return False
-
-
-class BargeInMonitor(DisabledBargeMonitor):
-    """Legacy test adapter; it never starts an automatic monitor."""
-
-    def __init__(self, capture=None, transcriber=None, app_stop_event=None, on_command=None):
-        self.transcriber = transcriber
-        self.on_command = on_command
-
-    def _recognize_segment(self, session_id, audio, cancel, pause_confirmed=False) -> bool:
-        if cancel.is_set():
-            return True
-        text = normalize_spoken_text(self.transcriber.transcribe(audio, cancel))
-        if pause_confirmed and (text in INTERRUPTION_COMMANDS or text in EXIT_COMMANDS):
-            self.on_command(session_id, text)
-            return True
-        return False
 
 
 class PerformanceTimeline:
@@ -561,7 +528,6 @@ class VoiceController(QObject):
         self._interrupted_session_id: int | None = None
         self._interruption_started_at: float | None = None
         self._tts_cooldown_until: float = 0.0
-        self._barge_monitor = DisabledBargeMonitor()
         self._normal_monitor: NormalSpeechMonitor | None = None
 
     @property
@@ -1035,25 +1001,6 @@ class VoiceController(QObject):
         self._set_state("LISTENING")
         logger.info("[PERF] key_interrupt_to_playback_stop: %.0f ms",
                     (time.perf_counter() - detected_at) * 1000.0)
-
-    def _handle_barge_in(self, session_id: int, command: str) -> None:
-        """Compatibility hook retained for older callers; never auto-wired."""
-        with self._pipeline_lock:
-            pipeline = self._pipeline
-            if self._active_session_id != session_id or pipeline is None:
-                return
-            self._interrupted_session_id = session_id
-        if command in EXIT_COMMANDS:
-            self.request_shutdown("voice exit command")
-            return
-        self.interrupt_tts(session_id, time.perf_counter())
-        with self._pipeline_lock:
-            self._pipeline = None
-            self._active_session_id = None
-        self._tts_cooldown_until = 0.0
-        self.interrupted.emit()
-        self._set_state("INTERRUPTED")
-        self._set_state("LISTENING")
 
     def _recover_microphone(self) -> bool:
         self._set_state("ERROR")

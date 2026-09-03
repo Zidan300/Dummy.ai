@@ -128,24 +128,15 @@ class CommandRegressionTests(unittest.TestCase):
         np.testing.assert_array_equal(normal, barge)
 
     def test_barge_command_requires_pause_confirmation(self):
-        class FakeTranscriber:
-            def transcribe(self, audio, cancel):
-                return "stop"
-
-        from main import BargeInMonitor
-
-        commands = []
-        monitor = BargeInMonitor(
-            object(),
-            FakeTranscriber(),
-            threading.Event(),
-            lambda session_id, command: commands.append((session_id, command)),
+        controller = VoiceController()
+        controller._set_state("SPEAKING")
+        controller._pipeline = ResponsePipeline(
+            "test", controller.stop_event, FakePlayer(),
+            lambda: None, lambda: None, lambda: None, lambda exc: None,
         )
-        audio = np.zeros(FRAME_SIZE, dtype=np.float32)
-        self.assertFalse(monitor._recognize_segment(7, audio, threading.Event(), False))
-        self.assertEqual(commands, [])
-        self.assertTrue(monitor._recognize_segment(7, audio, threading.Event(), True))
-        self.assertEqual(commands, [(7, "stop")])
+        controller._active_session_id = 1
+        controller.keyboard_interrupt()
+        self.assertEqual(controller._state, "LISTENING")
 
     def test_barge_detector_can_offer_audio_before_normal_silence_window(self):
         class FakeVad:
@@ -385,7 +376,8 @@ class ResponsePipelineRegressionTests(unittest.TestCase):
             controller._pipeline = pipeline
             controller._active_session_id = 41
 
-        controller._handle_barge_in(41, "stop")
+        controller._set_state("SPEAKING")
+        controller.keyboard_interrupt()
 
         self.assertTrue(pipeline.is_cancelled())
         self.assertEqual(controller._active_session_id, None)
@@ -397,20 +389,6 @@ class ResponsePipelineRegressionTests(unittest.TestCase):
 
     def test_controller_does_not_block_on_response_playback(self):
         controller = VoiceController()
-        class NoopBargeMonitor:
-            def start(self, session_id):
-                del session_id
-
-            def stop(self, session_id=None):
-                del session_id
-
-            def set_playback_guard(self, session_id):
-                del session_id
-
-            def request_stop(self, session_id):
-                del session_id
-
-        controller._barge_monitor = NoopBargeMonitor()
         controller.transcriber = type(
             "FakeTranscriber",
             (),
@@ -455,7 +433,7 @@ class ResponsePipelineRegressionTests(unittest.TestCase):
             controller._pipeline = pipeline
             controller._active_session_id = 42
 
-        controller._handle_barge_in(42, "exit")
+        controller.request_shutdown("test exit")
 
         self.assertTrue(controller.stop_event.is_set())
         self.assertTrue(pipeline.is_cancelled())

@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import unittest
 
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QKeyEvent
+from PySide6.QtWidgets import QApplication
+
+from interface import DummyInterface
 from main import ResponsePipeline, VoiceController
 
 
@@ -24,6 +29,10 @@ class FakePlayer:
 
 
 class KeyboardInterruptionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
     def _controller_with_pipeline(self, state):
         controller = VoiceController()
         controller._set_state(state)
@@ -76,9 +85,15 @@ class KeyboardInterruptionTests(unittest.TestCase):
         self.assertTrue(controller.stop_event.is_set())
         self.assertEqual(controller._state, "SHUTTING_DOWN")
 
-    def test_automatic_monitor_is_disabled(self):
-        controller = VoiceController()
-        self.assertFalse(hasattr(controller._barge_monitor, "start"))
+    def test_s_key_emits_only_for_physical_non_repeat_key(self):
+        widget = DummyInterface()
+        events = []
+        widget.interrupt_requested.connect(lambda: events.append(True))
+        widget.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_S, Qt.NoModifier, "s", False))
+        widget.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_S, Qt.NoModifier, "s", True))
+        widget.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_A, Qt.NoModifier, "a", False))
+        self.assertEqual(events, [True])
+        widget.close()
 
     def test_controller_keeps_one_persistent_microphone(self):
         controller = VoiceController()
