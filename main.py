@@ -23,6 +23,7 @@ from ai import (
 from audio import (
     AudioCapture,
     AudioError,
+    BargeInDetector,
     TranscriptionError,
     UtteranceDetector,
     VadError,
@@ -302,9 +303,9 @@ class ResponsePipeline:
 
 
 class BargeInMonitor:
-    """Listen for an exact interruption phrase during one response session."""
+    """Recognize explicit control phrases on a short rolling VAD path."""
 
-    SPEAKER_START_GUARD_SECONDS = 0.35
+    SPEAKER_START_GUARD_SECONDS = 0.45
 
     def __init__(self, capture, transcriber, app_stop_event, on_command) -> None:
         self.capture = capture
@@ -365,46 +366,60 @@ class BargeInMonitor:
     def _run(self, session_id: int, local_stop: threading.Event) -> None:
         cancel = CombinedCancellation(self.app_stop_event, local_stop)
         try:
-            detector = UtteranceDetector()
+            detector = BargeInDetector()
             while not cancel.is_set():
-                with self._lock:
-                    guard_until = self._guard_until
                 try:
-                    audio = detector.listen(
+                    detector.listen_for_segments(
                         self.capture,
                         cancel,
-                        ignore_until=guard_until,
-                        max_utterance_seconds=3.0,
+                        on_speech_detected=lambda: logger.info("[BARGE] speech detected"),
+                        on_segment=lambda audio, pause_confirmed: self._recognize_segment(
+                            session_id,
+                            audio,
+                            cancel,
+                            pause_confirmed=pause_confirmed,
+                        ),
+                        ignore_until=lambda: self._guard_until_for(session_id),
                     )
                 except (AudioError, VadError) as exc:
                     if not cancel.is_set():
-                        logger.error("Barge-in monitor failed: %s", exc)
+                        logger.error("[BARGE] monitor failed: %s", exc)
                     return
-                if audio is None or cancel.is_set():
-                    return
-                # Playback can begin while listen() is finishing a VAD
-                # segment. Discard that segment if the speaker-start guard
-                # was raised during the read, rather than transcribing
-                # Dummy's own audio as a possible command.
-                with self._lock:
-                    guard_until = self._guard_until
-                if time.monotonic() < guard_until:
-                    continue
-
-                try:
-                    text = self.transcriber.transcribe(audio, cancel)
-                except TranscriptionError as exc:
-                    if not cancel.is_set():
-                        logger.error("Barge-in transcription failed: %s", exc)
-                    continue
-
-                command = normalize_spoken_text(text)
-                if command in INTERRUPTION_COMMANDS or command in EXIT_COMMANDS:
-                    self.on_command(session_id, command)
+                if cancel.is_set():
                     return
         except Exception as exc:
             if not cancel.is_set():
-                logger.exception("Barge-in worker failed: %s", exc)
+                logger.exception("[BARGE] worker failed: %s", exc)
+
+    def _recognize_segment(
+        self,
+        session_id: int,
+        audio,
+        cancel,
+        pause_confirmed: bool = False,
+    ) -> bool:
+        if cancel.is_set():
+            return True
+        logger.info("[BARGE] recognition started")
+        try:
+            text = self.transcriber.transcribe(audio, cancel)
+        except TranscriptionError as exc:
+            if not cancel.is_set():
+                logger.error("[BARGE] transcription failed: %s", exc)
+            return False
+
+        command = normalize_spoken_text(text)
+        is_control = command in INTERRUPTION_COMMANDS or command in EXIT_COMMANDS
+        if is_control and pause_confirmed:
+            self.on_command(session_id, command)
+            return True
+        return False
+
+    def _guard_until_for(self, session_id: int) -> float:
+        with self._lock:
+            if self._session_id != session_id:
+                return time.monotonic()
+            return self._guard_until
 
 
 class VoiceController(QObject):
@@ -466,14 +481,22 @@ class VoiceController(QObject):
         if session_id is not None and active_session_id != session_id:
             return
 
+        barge = session_id is not None
         if pipeline is not None:
             pipeline.cancel()
             if not pipeline.generation_finished.is_set():
-                logger.info("Gemma generation cancellation requested")
-            logger.info("TTS queue cleared")
+                logger.info("%sGemma cancellation requested", "[BARGE] " if barge else "")
+            logger.info("%sTTS queue cleared", "[BARGE] " if barge else "")
         if self.player.cancel():
-            logger.info("Active ffplay terminated")
+            logger.info("%sffplay terminated", "[BARGE] " if barge else "")
+        self.audio.clear_pending_frames()
+        if barge:
+            logger.info("[BARGE] microphone buffer cleared")
         if detected_at is not None:
+            logger.info(
+                "[BARGE] interruption latency: %.0f ms",
+                (time.perf_counter() - detected_at) * 1000.0,
+            )
             logger.info(
                 "[PERF] Barge-in response: %.2fs",
                 time.perf_counter() - detected_at,
@@ -709,7 +732,9 @@ class VoiceController(QObject):
                     self.player.reset_cancellation()
                 except TTSError:
                     logger.exception("Could not reset TTS cancellation state")
-                self._set_state("LISTENING")
+            self._set_state("LISTENING")
+            if self._interrupted_session_id == session_id:
+                logger.info("[BARGE] LISTENING")
 
     def _handle_barge_in(self, session_id: int, command: str) -> None:
         detected_at = time.perf_counter()
@@ -724,13 +749,18 @@ class VoiceController(QObject):
                 return
             self._interrupted_session_id = session_id
             self._interruption_started_at = detected_at
+            logger.info("[BARGE] session invalidated")
 
-        logger.info('Barge-in detected: "%s"', command)
+        logger.info('[BARGE] recognized: "%s"', command)
         if command in EXIT_COMMANDS:
             self.request_shutdown("voice exit command during response")
             return
+        logger.info("[BARGE] interruption confirmed")
         self.interrupt_tts(session_id, detected_at)
         self._barge_monitor.request_stop(session_id)
+        with self._pipeline_lock:
+            if self._active_session_id == session_id:
+                self._active_session_id = None
         self._set_state("INTERRUPTED")
 
     def _recover_microphone(self) -> bool:

@@ -33,6 +33,14 @@ SILENCE_DURATION = 0.72
 SILENCE_FRAMES = math.ceil(SILENCE_DURATION * 1000 / FRAME_MS)
 MAX_UTTERANCE_SECONDS = 20.0
 
+# Barge-in uses the same VAD and persistent capture stream, but it is allowed
+# to hand short rolling segments to Whisper before normal utterance silence.
+BARGE_MIN_AUDIO_SECONDS = 0.36
+BARGE_RECOGNITION_INTERVAL_SECONDS = 0.18
+BARGE_MAX_SEGMENT_SECONDS = 1.20
+BARGE_MAX_SEGMENT_FRAMES = math.ceil(BARGE_MAX_SEGMENT_SECONDS * 1000 / FRAME_MS)
+BARGE_CONFIRM_SILENCE_FRAMES = math.ceil(0.12 * 1000 / FRAME_MS)
+
 
 class AudioError(RuntimeError):
     """A microphone or audio-stream failure that may be recoverable."""
@@ -309,6 +317,128 @@ class UtteranceDetector:
         if not frames:
             return np.array([], dtype=np.float32)
         return np.concatenate(frames).astype(np.float32) / 32768.0
+
+
+class BargeInDetector:
+    """Collect short rolling speech segments for low-latency control words."""
+
+    def __init__(self, aggressiveness: int = VAD_AGGRESSIVENESS) -> None:
+        try:
+            self._vad = webrtcvad.Vad(aggressiveness)
+        except Exception as exc:
+            raise VadError(f"Barge-in VAD initialization failed: {exc}") from exc
+
+    def listen_for_segments(
+        self,
+        capture: AudioCapture,
+        stop_event,
+        on_segment,
+        on_speech_detected=None,
+        ignore_until=0.0,
+    ) -> None:
+        """Run until the current speech ends or ``on_segment`` confirms control.
+
+        The callback is invoked on bounded rolling audio windows. Returning
+        True stops the collector immediately; False continues collecting the
+        same utterance. Normal questions therefore remain harmless while a
+        short, explicit STOP can be recognized before the silence timeout.
+        """
+        prebuffer: deque[np.ndarray] = deque(maxlen=PREBUFFER_FRAMES)
+        speech_frames: list[np.ndarray] = []
+        speech_duration_frames = 0
+        speech_run = 0
+        silence_run = 0
+        speaking = False
+        last_attempt_at = 0.0
+
+        def current_ignore_until() -> float:
+            value = ignore_until() if callable(ignore_until) else ignore_until
+            return float(value)
+
+        def reset_segment() -> None:
+            nonlocal speech_frames, speech_duration_frames, speech_run
+            nonlocal silence_run, speaking, last_attempt_at
+            prebuffer.clear()
+            speech_frames = []
+            speech_duration_frames = 0
+            speech_run = 0
+            silence_run = 0
+            speaking = False
+            last_attempt_at = 0.0
+
+        while not stop_event.is_set():
+            if time.monotonic() < current_ignore_until():
+                reset_segment()
+                capture.read_frame(timeout=0.1)
+                continue
+
+            for kind, message in capture.drain_events():
+                if kind == "overflow":
+                    logger.warning("Audio input overflow during barge-in; continuing")
+                else:
+                    raise AudioError(message)
+
+            if not capture.is_active():
+                raise AudioError("microphone stream is no longer active")
+            if hasattr(capture, "is_healthy") and not capture.is_healthy():
+                raise AudioError("microphone stream stopped delivering audio")
+
+            frame = capture.read_frame()
+            if frame is None:
+                continue
+
+            try:
+                is_speech = self._vad.is_speech(frame.tobytes(), SAMPLE_RATE)
+            except Exception as exc:
+                raise VadError(f"Barge-in VAD processing failed: {exc}") from exc
+
+            if not speaking:
+                prebuffer.append(frame)
+                if is_speech:
+                    speech_run += 1
+                    if speech_run >= SPEECH_START_FRAMES:
+                        speaking = True
+                        speech_frames = list(prebuffer)
+                        speech_duration_frames = len(speech_frames)
+                        silence_run = 0
+                        last_attempt_at = 0.0
+                        if on_speech_detected:
+                            on_speech_detected()
+                else:
+                    speech_run = 0
+                continue
+
+            speech_frames.append(frame)
+            speech_duration_frames += 1
+            if len(speech_frames) > BARGE_MAX_SEGMENT_FRAMES:
+                speech_frames = speech_frames[-BARGE_MAX_SEGMENT_FRAMES:]
+            if is_speech:
+                silence_run = 0
+            else:
+                silence_run += 1
+
+            now = time.monotonic()
+            audio_seconds = speech_duration_frames * FRAME_MS / 1000.0
+            ready = audio_seconds >= BARGE_MIN_AUDIO_SECONDS
+            due = now - last_attempt_at >= BARGE_RECOGNITION_INTERVAL_SECONDS
+            if ready and due:
+                # Playback can begin while Whisper is being prepared. Drop
+                # the in-flight segment if the speaker guard was raised.
+                if now < current_ignore_until():
+                    reset_segment()
+                    continue
+                segment = speech_frames[-BARGE_MAX_SEGMENT_FRAMES:]
+                last_attempt_at = now
+                if on_segment(
+                    UtteranceDetector._to_float_audio(segment),
+                    silence_run >= BARGE_CONFIRM_SILENCE_FRAMES,
+                ):
+                    return
+
+            # Preserve the normal, conservative end-of-utterance behavior for
+            # non-control speech. Only the recognition start is accelerated.
+            if silence_run >= SILENCE_FRAMES:
+                return
 
 
 class WhisperTranscriber:
